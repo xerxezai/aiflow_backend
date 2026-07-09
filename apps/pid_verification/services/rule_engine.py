@@ -301,6 +301,102 @@ _RED001_FRAGMENT_PATTERNS = [
 ]
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Soft-coded ACCURACY POST-FILTERS (applied after every rule has emitted).
+# ─────────────────────────────────────────────────────────────────────────────
+# These knobs let engineering tune the report quality WITHOUT touching any rule
+# logic.  All filters are pure post-processing — they only ever drop / merge /
+# re-label findings; they NEVER invent new findings.
+#
+#   _DISABLED_RULE_IDS         : rule_ids whose findings are dropped entirely.
+#                                Use to silence chronically noisy rules per-project.
+#   _RULE_SEVERITY_OVERRIDES   : rule_id → final severity.  Use to demote a rule
+#                                from 'major' to 'minor' (or promote) without
+#                                editing each emit-site.
+#   _GLOBAL_EVIDENCE_NOISE_RES : list of compiled regex; if a finding's evidence
+#                                FULLMATCHES any of these, the finding is dropped.
+#                                Catches OCR fragments that survive rule-level
+#                                filters (e.g. stray '-N', '013842').
+#   _MIN_EVIDENCE_LEN          : evidence shorter than this (after strip) is
+#                                dropped.  0 = disabled.
+#   _DEDUPE_BY_RULE_AND_EVIDENCE: when True, keeps only the FIRST finding per
+#                                (rule_id, normalised-evidence) pair.  Prevents
+#                                the same tag being flagged 3× by the same rule
+#                                because it appeared at 3 OCR positions.
+#   _DEDUPE_NORMALISE_EVIDENCE : function applied before dedupe-comparison.
+#                                Default: upper-case + collapse whitespace.
+# ═══════════════════════════════════════════════════════════════════════════
+_DISABLED_RULE_IDS: set = set()        # e.g. {'TAG-003'} silences "non-standard format" globally
+_RULE_SEVERITY_OVERRIDES: Dict[str, str] = {
+    # Example (commented — uncomment per-project):
+    # 'TAG-003': 'minor',
+    # 'LSZ-007': 'minor',
+}
+# Evidence patterns that indicate OCR noise / unparseable fragments.  Findings
+# whose evidence fullmatches ANY of these are dropped before the report is
+# returned.  Reuses the same fragment patterns already trusted by RED-001 and
+# adds a few generally noisy tokens.
+_GLOBAL_EVIDENCE_NOISE_RES: list = list(_RED001_FRAGMENT_PATTERNS) + [
+    re.compile(r'^[A-Z]\.?$'),                     # single letters like 'N.' or 'X'
+    re.compile(r'^[\s\-_./:;,\(\)\[\]]+$'),       # punctuation soup
+    re.compile(r'^\d+(?:\.\d+)?\s*(?:mm|cm|m)?$'), # bare numbers ± unit only
+]
+_MIN_EVIDENCE_LEN: int = 0             # 0 disables; 2 drops single-char evidence
+_DEDUPE_BY_RULE_AND_EVIDENCE: bool = True
+def _DEDUPE_NORMALISE_EVIDENCE(s: str) -> str:
+    return ' '.join((s or '').upper().split())
+
+
+def _apply_accuracy_filters(findings: List['RuleFinding']) -> List['RuleFinding']:
+    """
+    Pure post-processing filter — never adds findings, only drops/merges/re-labels.
+    Soft-coded via the constants above.  Logs a one-line summary of what was filtered.
+    """
+    if not findings:
+        return findings
+    before = len(findings)
+    out: List['RuleFinding'] = []
+    seen_keys: set = set()
+    dropped_disabled = dropped_noise = dropped_short = dropped_dup = severity_changed = 0
+
+    for f in findings:
+        # 1. Hard rule-id suppression
+        if f.rule_id in _DISABLED_RULE_IDS:
+            dropped_disabled += 1
+            continue
+        # 2. Evidence-noise filter
+        ev = (f.evidence or '').strip()
+        if ev and any(p.fullmatch(ev) for p in _GLOBAL_EVIDENCE_NOISE_RES):
+            dropped_noise += 1
+            continue
+        # 3. Minimum evidence length (only enforced when evidence is non-empty)
+        if _MIN_EVIDENCE_LEN > 0 and ev and len(ev) < _MIN_EVIDENCE_LEN:
+            dropped_short += 1
+            continue
+        # 4. Severity override
+        new_sev = _RULE_SEVERITY_OVERRIDES.get(f.rule_id)
+        if new_sev and new_sev != f.severity:
+            f.severity = new_sev
+            severity_changed += 1
+        # 5. (rule_id, evidence) dedupe
+        if _DEDUPE_BY_RULE_AND_EVIDENCE:
+            key = (f.rule_id, _DEDUPE_NORMALISE_EVIDENCE(ev))
+            if key in seen_keys:
+                dropped_dup += 1
+                continue
+            seen_keys.add(key)
+        out.append(f)
+
+    if before != len(out) or severity_changed:
+        logger.info(
+            "[rule_engine] accuracy filter: %d → %d findings "
+            "(disabled=%d noise=%d short=%d dup=%d severity_changed=%d)",
+            before, len(out), dropped_disabled, dropped_noise,
+            dropped_short, dropped_dup, severity_changed,
+        )
+    return out
+
+
 @dataclass
 class RuleFinding:
     category:        str
@@ -335,6 +431,9 @@ def run_rules(extraction: Dict[str, Any], graph) -> List[RuleFinding]:
     findings.extend(_check_pressure_annotations(extraction))
     findings.extend(_check_equipment_size_annotations(extraction))
     findings.extend(_check_compressor_equipment(extraction))
+
+    # Soft-coded accuracy post-filter (drops noise, dedupes, applies severity overrides).
+    findings = _apply_accuracy_filters(findings)
 
     # Sort deterministically: rule_id → issue_observed
     findings.sort(key=lambda f: (f.rule_id, f.issue_observed))

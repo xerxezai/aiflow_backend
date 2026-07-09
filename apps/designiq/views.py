@@ -1842,7 +1842,245 @@ class EngineeringListItemViewSet(viewsets.ModelViewSet):
             return Response({
                 "error": f"Failed to download output: {str(e)}"
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
+
+    # ------------------------------------------------------------------
+    # SOFT-CODED OUTPUT MANAGEMENT — Delete / Modify / Recheck
+    # Editable metadata fields and recheck behaviour are configured in one
+    # place so SuperAdmin can extend without touching action handlers.
+    # ------------------------------------------------------------------
+    OUTPUT_EDITABLE_FIELDS = (
+        'pid_number', 'pid_revision', 'format_type',
+        'enrichment_enabled', 'include_area', 'list_type',
+    )
+
+    def _can_modify_output(self, request, output):
+        """SOFT-CODED ownership/admin check — owner or staff/superuser may modify."""
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if user.is_superuser or user.is_staff:
+            return True
+        return output.processed_by_id == user.id
+
+    @action(detail=False, methods=['delete'], url_path='delete_output/(?P<output_id>[^/.]+)')
+    def delete_output(self, request, output_id=None):
+        """
+        Delete a previously generated output (record + file on disk).
+        DELETE /api/v1/designiq/lists/delete_output/{output_id}/
+        """
+        from .models import ProcessedPIDOutput
+        try:
+            output = ProcessedPIDOutput.objects.get(id=output_id)
+        except ProcessedPIDOutput.DoesNotExist:
+            return Response({'error': 'Output not found'}, status=status.HTTP_404_NOT_FOUND)
+        if not self._can_modify_output(request, output):
+            return Response(
+                {'error': 'You do not have permission to delete this output.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        try:
+            filename = output.excel_filename
+            # Best-effort delete of the underlying file
+            if output.excel_file:
+                try:
+                    output.excel_file.delete(save=False)
+                except Exception as file_err:
+                    logger.warning(f"Could not delete file for output {output_id}: {file_err}")
+            output.delete()
+            logger.info(f"🗑️ Deleted ProcessedPIDOutput {output_id} ({filename}) by {request.user}")
+            return Response({
+                'success': True,
+                'deleted_id': output_id,
+                'message': f'Deleted {filename}',
+            })
+        except Exception as e:
+            logger.error(f"Error deleting output {output_id}: {e}", exc_info=True)
+            return Response({'error': f'Failed to delete: {str(e)}'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['patch', 'put'], url_path='update_output/(?P<output_id>[^/.]+)')
+    def update_output(self, request, output_id=None):
+        """
+        Modify editable metadata of a previously generated output.
+        PATCH /api/v1/designiq/lists/update_output/{output_id}/
+        Body (JSON): any subset of OUTPUT_EDITABLE_FIELDS.
+        """
+        from .models import ProcessedPIDOutput
+        try:
+            output = ProcessedPIDOutput.objects.get(id=output_id)
+        except ProcessedPIDOutput.DoesNotExist:
+            return Response({'error': 'Output not found'}, status=status.HTTP_404_NOT_FOUND)
+        if not self._can_modify_output(request, output):
+            return Response(
+                {'error': 'You do not have permission to modify this output.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        payload = request.data if isinstance(request.data, dict) else {}
+        applied = {}
+        rejected = []
+        for field, value in payload.items():
+            if field not in self.OUTPUT_EDITABLE_FIELDS:
+                rejected.append(field)
+                continue
+            # Light coercion for booleans coming from form encodings
+            if field in ('enrichment_enabled', 'include_area'):
+                value = str(value).lower() in ('1', 'true', 'yes', 'on')
+            setattr(output, field, value)
+            applied[field] = value
+
+        if not applied:
+            return Response({
+                'error': 'No editable fields supplied.',
+                'editable_fields': list(self.OUTPUT_EDITABLE_FIELDS),
+                'rejected': rejected,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            output.save(update_fields=list(applied.keys()) + ['updated_at'])
+        except Exception:
+            # Fallback if updated_at field is auto-managed differently
+            output.save()
+
+        logger.info(f"✏️ Updated ProcessedPIDOutput {output_id}: {applied} by {request.user}")
+        return Response({
+            'success': True,
+            'id': output_id,
+            'applied': applied,
+            'rejected': rejected,
+        })
+
+    @action(detail=False, methods=['post'], url_path='recheck_output/(?P<output_id>[^/.]+)')
+    def recheck_output(self, request, output_id=None):
+        """
+        Re-validate a previously generated Excel file.
+
+        Re-opens the stored Excel, recounts lines/columns, refreshes file_size,
+        runs basic structural checks, and returns a health report.
+        Does NOT re-run OCR (the source PDF is not retained).
+
+        POST /api/v1/designiq/lists/recheck_output/{output_id}/
+        """
+        from .models import ProcessedPIDOutput
+        try:
+            output = ProcessedPIDOutput.objects.get(id=output_id)
+        except ProcessedPIDOutput.DoesNotExist:
+            return Response({'error': 'Output not found'}, status=status.HTTP_404_NOT_FOUND)
+        if not self._can_modify_output(request, output):
+            return Response(
+                {'error': 'You do not have permission to recheck this output.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        if not output.excel_file:
+            return Response({
+                'success': False,
+                'health': 'missing_file',
+                'message': 'No Excel file is associated with this output.',
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        # SOFT-CODED recheck thresholds — health classification rules.
+        RECHECK_THRESHOLDS = {
+            'min_lines': 1,
+            'min_columns': 4,
+            'expected_columns_strict': 35,
+        }
+
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            return Response({
+                'success': False,
+                'error': 'openpyxl is not installed on the server.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        issues = []
+        try:
+            if not output.excel_file.storage.exists(output.excel_file.name):
+                output.total_lines = 0
+                output.save(update_fields=['total_lines'])
+                return Response({
+                    'success': False,
+                    'health': 'missing_file',
+                    'message': 'Excel file is no longer present on storage.',
+                    'output_id': output_id,
+                })
+
+            with output.excel_file.open('rb') as fh:
+                wb = load_workbook(fh, read_only=True, data_only=True)
+                ws = wb.active
+                # Header row
+                header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), tuple())
+                actual_columns = sum(1 for c in header if c not in (None, ''))
+                # Count non-empty data rows (skip header)
+                actual_lines = 0
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    if any(cell not in (None, '') for cell in row):
+                        actual_lines += 1
+                wb.close()
+
+            # Refresh file_size from storage
+            try:
+                actual_size = output.excel_file.size
+            except Exception:
+                actual_size = output.file_size
+
+            # Health classification (soft-coded)
+            if actual_lines < RECHECK_THRESHOLDS['min_lines']:
+                issues.append('No data rows detected')
+            if actual_columns < RECHECK_THRESHOLDS['min_columns']:
+                issues.append(f"Only {actual_columns} columns (expected ≥ {RECHECK_THRESHOLDS['min_columns']})")
+            if (output.enrichment_enabled
+                    and actual_columns < RECHECK_THRESHOLDS['expected_columns_strict']):
+                issues.append(
+                    f"Enriched output should have {RECHECK_THRESHOLDS['expected_columns_strict']} "
+                    f"columns, found {actual_columns}"
+                )
+
+            health = 'healthy' if not issues else (
+                'warning' if actual_lines >= RECHECK_THRESHOLDS['min_lines'] else 'invalid'
+            )
+
+            # Detect drift vs stored metadata
+            drift = {}
+            if output.total_lines != actual_lines:
+                drift['total_lines'] = {'old': output.total_lines, 'new': actual_lines}
+            if output.total_columns != actual_columns:
+                drift['total_columns'] = {'old': output.total_columns, 'new': actual_columns}
+            if output.file_size != actual_size:
+                drift['file_size'] = {'old': output.file_size, 'new': actual_size}
+
+            # Persist refreshed metadata
+            output.total_lines = actual_lines
+            output.total_columns = actual_columns
+            output.file_size = actual_size
+            output.save(update_fields=['total_lines', 'total_columns', 'file_size'])
+
+            logger.info(
+                f"🔁 Rechecked output {output_id}: lines={actual_lines}, "
+                f"cols={actual_columns}, health={health}, drift={bool(drift)}"
+            )
+            return Response({
+                'success': True,
+                'output_id': output_id,
+                'health': health,
+                'issues': issues,
+                'drift': drift,
+                'stats': {
+                    'total_lines': actual_lines,
+                    'total_columns': actual_columns,
+                    'file_size_mb': round((actual_size or 0) / (1024 * 1024), 2),
+                },
+                'thresholds': RECHECK_THRESHOLDS,
+            })
+        except Exception as e:
+            logger.error(f"Error rechecking output {output_id}: {e}", exc_info=True)
+            return Response({
+                'success': False,
+                'health': 'error',
+                'error': f'Failed to recheck: {str(e)}',
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     @action(detail=False, methods=['post'], url_path='base_extraction')
     def base_extraction(self, request):
         """

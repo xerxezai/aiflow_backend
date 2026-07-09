@@ -26,6 +26,10 @@ from .instrument_index_views import (
     download_instrument_index_excel,
     get_instrument_categories,
 )
+from .cable_block_views import (
+    extract_cable_block_diagram,
+    download_cable_block_excel,
+)
 from .equipment_analysis_views import (
     analyze_pid_equipment,
     analyze_pid_equipment_batch,
@@ -170,6 +174,10 @@ urlpatterns = [
     path('instrument-index/analyze/', extract_instrument_index, name='instrument-index-analyze'),
     path('instrument-index/download-excel/<str:upload_id>/', download_instrument_index_excel, name='instrument-index-download'),
     path('instrument-index/categories/', get_instrument_categories, name='instrument-index-categories'),
+
+    # Cable Block Diagram — ADNOC-aligned JB / multicore / cabinet layout
+    path('cable-block-diagram/analyze/', extract_cable_block_diagram, name='cable-block-diagram-analyze'),
+    path('cable-block-diagram/download-excel/<str:upload_id>/', download_cable_block_excel, name='cable-block-diagram-download'),
     
     # Equipment Analysis endpoints
     path('equipment/analyze/', analyze_pid_equipment, name='equipment-analyze'),

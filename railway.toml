@@ -1,8 +1,0 @@
-[build]
-builder = "nixpacks"
-
-[deploy]
-# Files are executable in git repo (100755 permissions)
-# No chmod needed - scripts can run directly
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 3

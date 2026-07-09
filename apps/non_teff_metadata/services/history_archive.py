@@ -247,6 +247,156 @@ def archive_result(job, user) -> Optional[str]:
     return result_key if ok else None
 
 
+# ---------------------------------------------------------------------------
+# Bulk-batch archival — mirrors archive_source/archive_result for batches.
+# Uses the same path scheme so admins can grep one prefix for everything:
+#
+#   s3://<bucket>/non-teff/<role>/<user_id>/batch-<batch_id>/manifest.json
+#   s3://<bucket>/non-teff/<role>/<user_id>/batch-<batch_id>/master_index.json
+#   s3://<bucket>/non-teff/<role>/<user_id>/batch-<batch_id>/sources/<file>
+#
+# The 'batch-' prefix on the folder name lets list_history tell job vs batch
+# entries apart without a separate listing call.
+# ---------------------------------------------------------------------------
+def _batch_prefix(role: str, user_id: Any, batch_id: str) -> str:
+    return (f"{HISTORY_CONFIG['root_prefix']}/{role}/"
+            f"{user_id or 'anonymous'}/batch-{batch_id}")
+
+
+def archive_batch_source(batch, item, file_path: str) -> Optional[str]:
+    """
+    Upload ONE source file from a bulk batch item to S3. Best-effort.
+    Returns the S3 key on success, or None.
+    Called per-file during upload so failures don't accumulate.
+    """
+    if not HISTORY_CONFIG['enabled']:
+        return None
+    s3, bucket = _get_s3()
+    if not s3 or not bucket or not file_path or not os.path.exists(file_path):
+        return None
+
+    user  = batch.created_by
+    role  = resolve_user_role(user)
+    # Preserve relative folder structure under sources/ so admins can browse.
+    rel   = (item.relative_path or item.file_name or '').replace('\\', '/').lstrip('/')
+    key   = f"{_batch_prefix(role, getattr(user, 'id', None), str(batch.batch_id))}/sources/{rel}"
+    ctype, _ = mimetypes.guess_type(file_path)
+    try:
+        with open(file_path, 'rb') as fh:
+            ok = _put_object(s3, bucket, key, fh,
+                             ctype or 'application/octet-stream',
+                             metadata={
+                                 'batch_id':  str(batch.batch_id),
+                                 'item_id':   str(item.item_id),
+                                 'file_name': item.file_name or '',
+                                 'role':      role,
+                                 'user_id':   str(getattr(user, 'id', '') or ''),
+                             })
+        return key if ok else None
+    except Exception as exc:
+        logger.warning('Batch source archive failed (%s): %s',
+                       item.file_name, exc)
+        return None
+
+
+def archive_batch_result(batch) -> Optional[str]:
+    """
+    Upload the aggregated master-index JSON + manifest for a completed
+    batch. Best-effort. Returns the master_index.json key on success.
+    Called once after extraction finishes.
+    """
+    if not HISTORY_CONFIG['enabled']:
+        return None
+    s3, bucket = _get_s3()
+    if not s3 or not bucket:
+        return None
+
+    user  = batch.created_by
+    role  = resolve_user_role(user)
+    base  = _batch_prefix(role, getattr(user, 'id', None), str(batch.batch_id))
+
+    # Aggregate every item.fields dict into the master-index payload. Same
+    # shape the frontend canvas consumes — no extra core logic needed.
+    items = list(batch.items.all().order_by('file_name'))
+    payload = {
+        'batch_id':    str(batch.batch_id),
+        'name':        batch.name or '',
+        'plant':       batch.plant or '',
+        'status':      batch.status,
+        'total_files': batch.total_files,
+        'ready_files': batch.ready_files,
+        'failed_files': batch.failed_files,
+        'items':       [it.fields or {} for it in items],
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+    result_key = f"{base}/master_index.json"
+    ok = _put_object(s3, bucket, result_key, body, 'application/json',
+                     metadata={'batch_id': str(batch.batch_id), 'role': role})
+
+    manifest = {
+        'kind':         'batch',
+        'batch_id':     str(batch.batch_id),
+        'name':         batch.name or '',
+        'plant':        batch.plant or '',
+        'status':       batch.status,
+        'role':         role,
+        'user_id':      getattr(user, 'id', None),
+        'total_files':  batch.total_files,
+        'ready_files':  batch.ready_files,
+        'failed_files': batch.failed_files,
+        'created_at':   batch.created_at.isoformat() if batch.created_at else None,
+        'archived_at':  datetime.now(timezone.utc).isoformat(),
+    }
+    _put_object(
+        s3, bucket, f"{base}/manifest.json",
+        json.dumps(manifest, ensure_ascii=False, indent=2).encode('utf-8'),
+        'application/json',
+    )
+    return result_key if ok else None
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics — lightweight read-only probe used by the History tab footer
+# and the /history/diagnostics/ endpoint.
+# ---------------------------------------------------------------------------
+def get_archive_diagnostics() -> Dict[str, Any]:
+    """Return a snapshot of S3 archival health (no writes)."""
+    info: Dict[str, Any] = {
+        'enabled':     bool(HISTORY_CONFIG.get('enabled')),
+        'bucket':      '',
+        'region':      '',
+        'root_prefix': HISTORY_CONFIG.get('root_prefix', ''),
+        'connected':   False,
+        'reachable':   False,
+        'error':       '',
+    }
+    try:
+        from django.conf import settings
+        info['bucket'] = (getattr(settings, 'AWS_STORAGE_BUCKET_NAME', '')
+                          or os.environ.get('AWS_STORAGE_BUCKET_NAME', ''))
+        info['region'] = (getattr(settings, 'AWS_S3_REGION_NAME', '')
+                          or os.environ.get('AWS_S3_REGION_NAME', ''))
+    except Exception as exc:
+        info['error'] = f'settings: {exc}'
+        return info
+
+    s3, bucket = _get_s3()
+    info['connected'] = bool(s3 and bucket)
+    if not info['connected']:
+        info['error'] = info['error'] or 'S3 client not initialised'
+        return info
+
+    try:
+        resp = s3.list_objects_v2(Bucket=bucket,
+                                  Prefix=f"{HISTORY_CONFIG['root_prefix']}/",
+                                  MaxKeys=1)
+        info['reachable']    = True
+        info['object_count'] = resp.get('KeyCount', 0)
+    except Exception as exc:
+        info['error'] = f'list: {exc}'
+    return info
+
+
 def list_history(user, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     Return a list of past extractions visible to ``user`` — unified across
@@ -273,6 +423,7 @@ def list_history(user, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
 
     rows: List[Dict[str, Any]] = []
     for j in job_qs.order_by('-created_at')[:n]:
+        j_role = resolve_user_role(j.created_by) if j.created_by else HISTORY_CONFIG['guest_role']
         rows.append({
             'kind':        'job',
             'job_id':      str(j.job_id),     # used by the frontend Re-open button
@@ -284,7 +435,8 @@ def list_history(user, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
             'created_at':  j.created_at.isoformat() if j.created_at else None,
             'created_by':  getattr(j.created_by, 'username', '') if j.created_by_id else '',
             'total_items': len((j.result_json or {}).get('items', [])) if j.result_json else 0,
-            'role_folder': resolve_user_role(j.created_by) if j.created_by else HISTORY_CONFIG['guest_role'],
+            'role_folder': j_role,
+            's3_prefix':   _job_prefix(j_role, getattr(j.created_by, 'id', None), str(j.job_id)),
         })
 
     # ---- Bulk batches -------------------------------------------------------
@@ -293,6 +445,7 @@ def list_history(user, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         batch_qs = batch_qs.filter(created_by=user)
 
     for b in batch_qs.order_by('-created_at')[:n]:
+        b_role = resolve_user_role(b.created_by) if b.created_by else HISTORY_CONFIG['guest_role']
         rows.append({
             'kind':        'batch',
             'job_id':      str(b.batch_id),   # frontend treats this opaquely
@@ -305,7 +458,8 @@ def list_history(user, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
             'created_by':  getattr(b.created_by, 'username', '') if b.created_by_id else '',
             'total_items': b.ready_files or b.total_files or b.items.count(),
             'plant':       b.plant or '',
-            'role_folder': resolve_user_role(b.created_by) if b.created_by else HISTORY_CONFIG['guest_role'],
+            'role_folder': b_role,
+            's3_prefix':   _batch_prefix(b_role, getattr(b.created_by, 'id', None), str(b.batch_id)),
         })
 
     # Merge + sort + cap

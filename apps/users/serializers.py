@@ -5,7 +5,11 @@ Smart data validation and transformation.
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.utils import timezone
-from .models import UserProfile
+from .models import UserProfile  # ⚠️ DEPRECATED - migrating to hr_core.EmployeeMaster
+
+# New employee management
+from apps.hr_core.models import EmployeeMaster
+from apps.hr_core.services import EmployeeService
 
 User = get_user_model()
 
@@ -20,7 +24,14 @@ SELF_REGISTRATION_ACTIVE = False
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
-    """Serializer for user profile."""
+    """
+    ⚠️ DEPRECATED - Serializer for old user profile model.
+    
+    This serializer is deprecated. New code should use EmployeeMasterSerializer
+    from apps.hr_core.serializers instead.
+    
+    Kept for backward compatibility with existing API endpoints.
+    """
     
     class Meta:
         model = UserProfile
@@ -84,7 +95,20 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         user.must_reset_password = False
         user.save()
         
-        # Create associated profile
-        UserProfile.objects.create(user=user)
+        # Create associated employee record using new EmployeeService
+        try:
+            EmployeeService.create_employee(
+                user=user,
+                email=user.email,
+                first_name=user.first_name or '',
+                last_name=user.last_name or ''
+            )
+        except Exception as e:
+            # Log error but don't fail registration if employee creation fails
+            import traceback
+            print(f"[WARNING] Failed to create EmployeeMaster record during registration: {str(e)}")
+            print(traceback.format_exc())
+            # Fallback to old UserProfile for backward compatibility
+            UserProfile.objects.create(user=user)
         
         return user

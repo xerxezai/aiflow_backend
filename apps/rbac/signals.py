@@ -36,3 +36,44 @@ def clear_user_permissions_cache(sender, instance, **kwargs):
     cache.delete(f'user_permissions_{profile_id}')
     cache.delete(f'user_modules_{profile_id}')
     print(f"[Cache] Cleared permissions and modules cache for user {profile_id}")
+
+
+# Soft-coded: read the default role code from rbac_config so a single config
+# change flips the baseline role for the whole system. Was previously hardcoded
+# to 'viewer' — now points to the Default role defined in DEFAULT_ROLE_CONFIG.
+def _get_default_role_code():
+    from .rbac_config import DEFAULT_ROLE_CONFIG
+    return DEFAULT_ROLE_CONFIG.get('code', 'default')
+
+
+@receiver(post_save, sender=UserProfile)
+def assign_default_role_on_profile_creation(sender, instance, created, **kwargs):
+    """
+    Auto-assign the system default role to every new UserProfile so that all
+    users have baseline access (engineering modules, common tools, HR
+    self-service) without manual intervention.
+
+    Super Administrators (Django is_superuser=True) are excluded — they
+    bypass every module check and do not need the Default role.
+
+    The role code is soft-coded via DEFAULT_ROLE_CONFIG in rbac_config.py.
+    """
+    if not created:
+        return
+
+    # Skip Super Administrators — they already bypass all access checks.
+    if getattr(instance.user, 'is_superuser', False):
+        return
+
+    from .models import Role, UserRole  # local import to avoid circular
+    default_code = _get_default_role_code()
+    try:
+        default_role = Role.objects.get(code=default_code, is_active=True)
+        UserRole.objects.get_or_create(
+            user_profile=instance,
+            role=default_role,
+            defaults={'is_primary': True},
+        )
+    except Role.DoesNotExist:
+        # Default role not yet seeded (e.g. fresh migrations) — skip silently.
+        pass

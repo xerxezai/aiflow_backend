@@ -1,7 +1,10 @@
 from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator, MaxValueValidator
+from django.utils import timezone
 import json
+import uuid
+import secrets
 
 
 class ElectricalEquipmentType(models.Model):
@@ -232,3 +235,189 @@ class DatasheetComment(models.Model):
 
     def __str__(self):
         return f"Comment on {self.datasheet.tag_number} by {self.commented_by}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Smart Generator — persistence for AI-generated datasheets
+# (transformer / dg_set / mv_switchgear). Decoupled from the legacy
+# `ElectricalDatasheet` form-based model above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Soft-coded enums
+EQUIPMENT_TYPE_CHOICES = [
+    ('transformer',    'Power / Distribution Transformer'),
+    ('dg_set',         'Emergency Diesel Generator Set'),
+    ('mv_switchgear',  '11KV Switchgear'),
+]
+
+VARIANT_CHOICES = [
+    ('power',        'Power (e.g. 25 MVA)'),
+    ('distribution', 'Distribution (e.g. 1.25 MVA)'),
+    ('default',      'Default'),
+]
+
+GENERATED_STATUS_CHOICES = [
+    ('draft',     'Draft'),
+    ('in_review', 'In Review'),
+    ('issued',    'Issued'),
+    ('archived',  'Archived'),
+]
+
+CELL_EDIT_SOURCE_CHOICES = [
+    ('manual',      'Manual edit'),
+    ('recheck',     'Applied from recheck'),
+    ('ai_suggest',  'AI suggestion'),
+    ('revert',      'Revision revert'),
+]
+
+
+class GeneratedDatasheet(models.Model):
+    """A persisted AI-generated datasheet (rows + summary + S3 artifacts)."""
+
+    id              = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user            = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name='generated_datasheets'
+    )
+    equipment_type  = models.CharField(max_length=32, choices=EQUIPMENT_TYPE_CHOICES, db_index=True)
+    variant         = models.CharField(max_length=32, choices=VARIANT_CHOICES, default='default')
+    title           = models.CharField(max_length=255, blank=True)
+    revision        = models.CharField(max_length=8, default='A')
+    status          = models.CharField(max_length=16, choices=GENERATED_STATUS_CHOICES, default='draft', db_index=True)
+
+    rows            = models.JSONField(default=list)
+    summary         = models.JSONField(default=dict, blank=True)
+    metadata        = models.JSONField(default=dict, blank=True)  # original_filename, project_info, …
+    source_files    = models.JSONField(default=list, blank=True)  # [{role, s3_key, filename, size, content_type}]
+
+    excel_s3_key    = models.CharField(max_length=512, blank=True)
+    pdf_s3_key      = models.CharField(max_length=512, blank=True)
+
+    is_archived     = models.BooleanField(default=False, db_index=True)
+    created_at      = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at      = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table         = 'electrical_generated_datasheets'
+        verbose_name     = 'Generated Datasheet'
+        verbose_name_plural = 'Generated Datasheets'
+        ordering         = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'equipment_type', '-created_at']),
+            models.Index(fields=['user', 'is_archived']),
+        ]
+
+    def __str__(self):
+        return f"{self.get_equipment_type_display()} · {self.title or self.id} (rev {self.revision})"
+
+
+class DatasheetCellEdit(models.Model):
+    """Append-only audit trail for cell edits on `GeneratedDatasheet`."""
+
+    id            = models.BigAutoField(primary_key=True)
+    datasheet     = models.ForeignKey(
+        GeneratedDatasheet, on_delete=models.CASCADE, related_name='cell_edits'
+    )
+    user          = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True
+    )
+    row_index     = models.IntegerField()
+    column_key    = models.CharField(max_length=32)        # 'vendor_data' | 'rev'
+    old_value     = models.TextField(blank=True)
+    new_value     = models.TextField(blank=True)
+    source        = models.CharField(max_length=16, choices=CELL_EDIT_SOURCE_CHOICES, default='manual')
+    changed_at    = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table     = 'electrical_datasheet_cell_edits'
+        ordering     = ['-changed_at']
+        indexes = [
+            models.Index(fields=['datasheet', 'row_index']),
+        ]
+
+    def __str__(self):
+        return f"#{self.datasheet_id} row={self.row_index} {self.column_key}: {self.old_value!r}→{self.new_value!r}"
+
+
+class GeneratedDatasheetRevision(models.Model):
+    """Snapshot of `rows` for a `GeneratedDatasheet` at a point in time."""
+
+    id            = models.BigAutoField(primary_key=True)
+    datasheet     = models.ForeignKey(
+        GeneratedDatasheet, on_delete=models.CASCADE, related_name='snapshots'
+    )
+    revision_label = models.CharField(max_length=16)       # e.g. 'v1', 'v2'
+    rows          = models.JSONField(default=list)
+    summary       = models.JSONField(default=dict, blank=True)
+    note          = models.CharField(max_length=255, blank=True)
+    created_by    = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True
+    )
+    created_at    = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = 'electrical_generated_datasheet_snapshots'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"#{self.datasheet_id} {self.revision_label}"
+
+
+class GeneratedDatasheetCellComment(models.Model):
+    """Cell-anchored discussion thread on a `GeneratedDatasheet`."""
+
+    id            = models.BigAutoField(primary_key=True)
+    datasheet     = models.ForeignKey(
+        GeneratedDatasheet, on_delete=models.CASCADE, related_name='cell_comments'
+    )
+    row_index     = models.IntegerField(null=True, blank=True)   # null = page-level
+    column_key    = models.CharField(max_length=32, blank=True)
+    user          = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='generated_datasheet_cell_comments'
+    )
+    text          = models.TextField()
+    is_resolved   = models.BooleanField(default=False)
+    created_at    = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = 'electrical_generated_datasheet_comments'
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['datasheet', 'row_index']),
+        ]
+
+
+def _share_token_default():
+    return secrets.token_urlsafe(32)
+
+
+class DatasheetShareLink(models.Model):
+    """Public read-only share token for a `GeneratedDatasheet`."""
+
+    id            = models.BigAutoField(primary_key=True)
+    datasheet     = models.ForeignKey(
+        GeneratedDatasheet, on_delete=models.CASCADE, related_name='share_links'
+    )
+    token         = models.CharField(max_length=64, unique=True, default=_share_token_default, db_index=True)
+    created_by    = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True
+    )
+    expires_at    = models.DateTimeField(null=True, blank=True)
+    max_views     = models.IntegerField(null=True, blank=True)
+    view_count    = models.IntegerField(default=0)
+    revoked       = models.BooleanField(default=False)
+    created_at    = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'electrical_datasheet_share_links'
+        ordering = ['-created_at']
+
+    def is_valid(self) -> bool:
+        if self.revoked:
+            return False
+        if self.expires_at and timezone.now() > self.expires_at:
+            return False
+        if self.max_views is not None and self.view_count >= self.max_views:
+            return False
+        return True

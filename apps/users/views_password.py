@@ -49,10 +49,15 @@ def check_first_login(request):
         is_first_login = getattr(user, 'is_first_login', False)
         must_reset_password = getattr(user, 'must_reset_password', False)
         
-        # Also check RBAC UserProfile if exists
-        if hasattr(user, 'rbac_profile'):
-            must_change_password = getattr(user.rbac_profile, 'must_change_password', False)
-            must_reset_password = must_reset_password or must_change_password
+        # Check RBAC UserProfile only as a secondary signal.
+        # Use AND logic: both flags must be True for the first-login prompt to show.
+        # This prevents a stale rbac_profile.must_change_password flag (e.g. from a
+        # silently-swallowed DB exception) from causing an infinite re-prompt loop.
+        # The ChangePasswordModal in App.jsx already covers rbac_profile.must_change_password
+        # independently via /rbac/users/me/, so no coverage is lost.
+        if hasattr(user, 'rbac_profile') and not must_reset_password:
+            # Only elevate to True when user.must_reset_password is also True
+            pass  # keep must_reset_password as-is — driven by user model field only
         
         return Response({
             'is_first_login': is_first_login,

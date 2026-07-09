@@ -94,27 +94,24 @@ def fix_inconsistent_history():
     print("SOFT-CODED DYNAMIC MIGRATION HISTORY FIXER".center(70))
     print("=" * 70 + "\n")
 
-    # ── 1. Load migration graph from disk ─────────────────────────────────────
-    print("🔍 Loading migration graph from disk...")
+    # ── 1. Load migration graph (uses RESOLVED graph, not raw disk files) ───────
+    # CRITICAL: Use loader.graph.node_map which already resolves special markers
+    # like __latest__ and __first__ to concrete migration names.
+    # Raw disk_migrations skip __latest__ deps, causing InconsistentMigrationHistory.
+    print("🔍 Loading resolved migration graph...")
     loader = MigrationLoader(connection, ignore_no_migrations=True)
 
-    # Build a dependency map: node → list of direct parents
-    # node = (app_label, migration_name)
+    # Build a dependency map from the RESOLVED graph (handles __latest__, __first__)
+    # node → list of direct parents (all concrete migration names)
     dep_graph = {}
-    for (app, name), migration_obj in loader.disk_migrations.items():
-        deps = []
-        for dep_app, dep_name in migration_obj.dependencies:
-            # Skip special markers like __first__ / __latest__
-            if dep_name.startswith('__'):
-                continue
-            # Skip cross-app deps to apps we don't manage (swappable etc.)
-            if (dep_app, dep_name) not in loader.disk_migrations:
-                continue
-            deps.append((dep_app, dep_name))
-        dep_graph[(app, name)] = deps
+    for node, migration_node in loader.graph.node_map.items():
+        parents = []
+        for parent_node in migration_node.parents:
+            parents.append(parent_node.key)
+        dep_graph[node] = parents
 
     total_migrations = len(dep_graph)
-    print(f"✅ Loaded {total_migrations} migration nodes across all apps\n")
+    print(f"✅ Loaded {total_migrations} migration nodes (with __latest__/__first__ resolved)\n")
 
     # ── 2. Query what the DB currently considers applied ──────────────────────
     print("🔍 Querying django_migrations table...")

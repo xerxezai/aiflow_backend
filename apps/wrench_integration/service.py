@@ -21,8 +21,199 @@ logger = logging.getLogger(__name__)
 # Timeouts
 _TIMEOUT_FAST = 15       # login / health
 _TIMEOUT_SEARCH = 90     # document/transmittal search (Wrench returns full dataset)
+_TIMEOUT_PROBE  = 8      # soft-coded shorter timeout for endpoint-existence probes
+                          # (used when iterating fallback REST paths that may 404)
 # Token freshness window – re-login if token older than this
 _TOKEN_MAX_AGE_MINUTES = 55
+
+# ─── Soft-coded per-host endpoint capability cache ───────────────────────────
+# Persists across requests within the Django process. Keyed by base_url so each
+# Wrench instance has its own profile. Values:
+#   • dead_paths      → set of REST paths that returned 404 (skip on retry)
+#   • winning_path    → first path that returned data for get_transmittal_documents
+#                       (tried FIRST on subsequent calls)
+#   • exhausted_until → epoch timestamp; while in the future, skip all REST
+#                       probes for trans-documents and jump straight to fallback
+# The cache is in-memory only — restart the backend to clear it.
+_WRENCH_ENDPOINT_PROFILE: dict = {}
+# How long to remember "all REST paths failed for this host" before re-probing.
+# Soft-coded; tune via WRENCH_EXHAUSTED_TTL_SECONDS env if needed.
+_TRANS_DOC_EXHAUSTED_TTL_SECONDS = 15 * 60   # 15 minutes
+
+
+def _host_profile(cfg: WrenchConfig) -> dict:
+    """Get or create the per-host capability profile."""
+    key = (cfg.base_url or '').strip().rstrip('/').lower()
+    prof = _WRENCH_ENDPOINT_PROFILE.get(key)
+    if prof is None:
+        prof = {'dead_paths': set(), 'winning_path': None, 'exhausted_until': 0.0}
+        _WRENCH_ENDPOINT_PROFILE[key] = prof
+    return prof
+
+
+# ─── Soft-coded SVC URL discovery patterns ───────────────────────────────────
+# The DocumentSearch service may live on the same host as the WebAPI or on a
+# dedicated SVC host. These patterns are tried in order; the first one that
+# returns a non-404 response wins. Admin-set svc_url always overrides this list.
+#
+# Each entry is a callable that, given the parsed base_url components, returns
+# a candidate base URL string (without trailing slash) — or None to skip.
+#
+# Real-world SmartProject installations observed:
+#   • https://<host>/                              ← single-server / SVC at root
+#   • https://<host>/<base_path>                   ← single-server / shared path
+#   • https://<host>/WrenchSVC                     ← path-based SVC mount
+#   • https://<host>/WrenchSearchSVC               ← dedicated search mount
+#   • https://<host>/WrenchSVC_<project>_<env>     ← parallel to WebAPI naming
+#   • https://<host>/WrenchService_<project>_<env>/SVC  ← Rejlers / newer SmartProject
+#   • https://<host>/<base_path>/SVC               ← /SVC mount appended to WebAPI path
+#   • https://svc.<host>/                          ← dedicated SVC subdomain
+#   • https://<host-prefix>-svc.<rest>             ← dash-separated SVC host
+#
+# Soft-coded suffixes that are part of OData/AtomPub metadata endpoints — admins
+# often paste these full metadata URLs (e.g. ".../SVC/AtomSVC.svc/") instead of the
+# JSON SearchObject base. The normaliser below strips them so the JSON service URL
+# is what gets used for /DocumentSearch/SearchObject calls.
+_SVC_URL_TRAILING_NOISE_SUFFIXES = (
+    # OData / AtomPub METADATA endpoints — admins often paste these directly.
+    # Note: bare "/AtomSVC.svc" and "/odata.svc" are NOT noise — they are part of
+    # the canonical SVC URL per the SmartProject docs (e.g. .../SVC/AtomSVC.svc).
+    # Only the metadata sub-path itself is stripped, so ".../AtomSVC.svc" remains.
+    '/$metadata',
+    '/odata',
+    # Operation-contract suffixes — admins may paste the full SearchObject
+    # operation URL (e.g. ".../AtomSVC.svc/https/DocumentSearch/SearchObject").
+    # Order matters: the longer / more-specific patterns are checked first so
+    # only the operation tail is removed, leaving ".../AtomSVC.svc" intact.
+    '/https/DocumentSearch/SearchObject',
+    '/https/DocumentSearch',
+    '/https/SearchObject',
+    '/DocumentSearch/SearchObject',
+    '/DocumentSearch',
+    '/SearchObject',
+)
+# Path tokens that, when found at the end, mean the URL is pointing at a
+# metadata sub-path. Currently no bare tokens are stripped — AtomSVC.svc /
+# odata.svc are legitimate and must be preserved.
+_SVC_URL_TRAILING_NOISE_TOKENS = ()
+
+
+def _normalise_svc_url(value: str) -> str:
+    """
+    Clean a user/admin-pasted SVC URL.
+    - Trim whitespace and trailing slashes.
+    - Collapse accidental double slashes in the path (e.g. ".com//Wrench…").
+    - Strip OData/AtomPub metadata suffixes so the JSON SVC base remains.
+    - Pure-string transform — never touches the search core logic.
+    """
+    if not value:
+        return value
+    cleaned = value.strip().rstrip('/')
+    # Collapse accidental "//" inside the path (after the scheme "://")
+    if '://' in cleaned:
+        scheme_part, rest = cleaned.split('://', 1)
+        # rest may contain netloc + path; only collapse leading-path "//"
+        while '//' in rest:
+            rest = rest.replace('//', '/')
+        cleaned = f'{scheme_part}://{rest}'
+    # Strip well-known metadata suffixes (case-insensitive)
+    lower = cleaned.lower()
+    for suffix in _SVC_URL_TRAILING_NOISE_SUFFIXES:
+        if lower.endswith(suffix.lower()):
+            cleaned = cleaned[: -len(suffix)]
+            lower = cleaned.lower()
+    # Strip trailing path segments that match noise tokens
+    parts = cleaned.split('/')
+    while parts and parts[-1].lower() in (t.lower() for t in _SVC_URL_TRAILING_NOISE_TOKENS):
+        parts.pop()
+    cleaned = '/'.join(parts).rstrip('/')
+    return cleaned
+
+
+_SVC_URL_PATH_TEMPLATES = [
+    # Same host, no path → most common when SVC sits at the root
+    lambda scheme, netloc, path: f"{scheme}://{netloc}",
+    # Same host, original path (single-server installs share the path)
+    lambda scheme, netloc, path: f"{scheme}://{netloc}{path}" if path else None,
+    # Same host, original path with /SVC appended (Rejlers WrenchService_*/SVC pattern)
+    lambda scheme, netloc, path: (
+        f"{scheme}://{netloc}{path}/SVC"
+        if path and not path.lower().endswith('/svc') else None
+    ),
+    # Path-replace WebAPI → Service + /SVC
+    # (e.g. /WrenchWebAPI_Rejlers_Live → /WrenchService_Rejlers_Live/SVC)
+    lambda scheme, netloc, path: (
+        f"{scheme}://{netloc}"
+        f"{path.replace('WebAPI', 'Service').replace('webapi', 'service')}/SVC"
+        if path and 'webapi' in path.lower() else None
+    ),
+    # Path-replace WebAPI → Service (no /SVC suffix — older deployments)
+    lambda scheme, netloc, path: (
+        f"{scheme}://{netloc}{path.replace('WebAPI', 'Service').replace('webapi', 'service')}"
+        if path and 'webapi' in path.lower() else None
+    ),
+    # Path-replace WebAPI → SVC (e.g. WrenchWebAPI_Rejlers_Live → WrenchSVC_Rejlers_Live)
+    lambda scheme, netloc, path: (
+        f"{scheme}://{netloc}{path.replace('WebAPI', 'SVC').replace('webapi', 'svc')}"
+        if path and 'webapi' in path.lower() else None
+    ),
+    # Path-replace WebAPI → SearchSVC
+    lambda scheme, netloc, path: (
+        f"{scheme}://{netloc}{path.replace('WebAPI', 'SearchSVC').replace('webapi', 'searchsvc')}"
+        if path and 'webapi' in path.lower() else None
+    ),
+    # Common path mounts on the same host
+    lambda scheme, netloc, path: f"{scheme}://{netloc}/WrenchSVC",
+    lambda scheme, netloc, path: f"{scheme}://{netloc}/WrenchSearchSVC",
+    lambda scheme, netloc, path: f"{scheme}://{netloc}/SearchSVC",
+    lambda scheme, netloc, path: f"{scheme}://{netloc}/SVC",
+    # Subdomain variants — only when host has a parent domain (e.g. acme.example.com)
+    lambda scheme, netloc, path: (
+        f"{scheme}://svc.{netloc}" if netloc.count('.') >= 2 else None
+    ),
+    lambda scheme, netloc, path: (
+        f"{scheme}://{netloc.split('.', 1)[0]}-svc.{netloc.split('.', 1)[1]}"
+        if netloc.count('.') >= 2 else None
+    ),
+    lambda scheme, netloc, path: (
+        f"{scheme}://{netloc.split('.', 1)[0]}svc.{netloc.split('.', 1)[1]}"
+        if netloc.count('.') >= 2 else None
+    ),
+]
+
+
+def build_svc_url_candidates(cfg: 'WrenchConfig') -> list:
+    """
+    Return an ordered, deduplicated list of candidate SVC base URLs to try.
+    Admin-configured cfg.svc_url always takes precedence and is the only entry returned
+    (after running through `_normalise_svc_url` so an admin can paste the AtomSVC.svc
+    metadata URL directly).
+    """
+    if cfg.svc_url:
+        normalised = _normalise_svc_url(cfg.svc_url)
+        if normalised:
+            return [normalised]
+
+    parsed = urlparse(cfg.base_url)
+    scheme = parsed.scheme or 'https'
+    netloc = parsed.netloc
+    path   = (parsed.path or '').rstrip('/')
+
+    seen = set()
+    candidates = []
+    for template in _SVC_URL_PATH_TEMPLATES:
+        try:
+            value = template(scheme, netloc, path)
+        except Exception:  # noqa: BLE001 - defensive against bad input
+            value = None
+        if not value:
+            continue
+        value = value.rstrip('/')
+        if value in seen:
+            continue
+        seen.add(value)
+        candidates.append(value)
+    return candidates
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -107,14 +298,14 @@ def _login(cfg: WrenchConfig) -> str:
 
 def _ensure_token(cfg: WrenchConfig) -> str:
     """
-    Return a valid session token.
+    Return a valid session token (decrypted, ready to send).
     Priority:
       1. pre_shared_token – used as-is, no expiry check (Wrench rolling refresh keeps it current).
       2. session_token    – used when still fresh (< _TOKEN_MAX_AGE_MINUTES).
       3. Fresh login      – called when no valid token is available.
     """
-    if cfg.pre_shared_token:
-        return cfg.pre_shared_token
+    if cfg.has_pre_shared_token():
+        return cfg.get_pre_shared_token()
     if _is_token_fresh(cfg):
         return cfg.session_token
     return _login(cfg)
@@ -123,16 +314,19 @@ def _ensure_token(cfg: WrenchConfig) -> str:
 def _refresh_token_from_response(cfg: WrenchConfig, data: dict) -> None:
     """
     Wrench returns a refreshed token in every response (rolling token).
-    - When pre_shared_token mode is active: update that field so future calls stay authenticated.
+    - When pre_shared_token mode is active: update that field (encrypted) so future calls stay authenticated.
     - Otherwise: update the standard session_token.
     """
     new_token = data.get('Token') or data.get('token')
     if not new_token:
         return
-    if cfg.pre_shared_token and new_token != cfg.pre_shared_token:
-        cfg.pre_shared_token = new_token
-        cfg.save(update_fields=['pre_shared_token'])
-    elif not cfg.pre_shared_token and new_token != cfg.session_token:
+    if cfg.has_pre_shared_token():
+        # Compare against decrypted current value to avoid useless writes.
+        current = cfg.get_pre_shared_token()
+        if new_token != current:
+            cfg.set_pre_shared_token(new_token)
+            cfg.save(update_fields=['pre_shared_token'])
+    elif new_token != cfg.session_token:
         _save_token(cfg, new_token)
 
 
@@ -171,6 +365,24 @@ def verify_connection(cfg: WrenchConfig) -> dict:
         return {'success': False, 'message': 'Unexpected error during connection test.'}
 
 
+# ─── SearchObject route + payload constants (soft-coded per SmartProject docs) ───
+# Per the official SmartProject API spec, the SearchObject operation lives at:
+#   <<SVC URL>>/https/DocumentSearch/SearchObject
+# The leading "/https" is the WCF binding name (AtomSVC.svc routes by binding).
+# Older / non-AtomSVC deployments expose the operation directly at
+#   <<SVC URL>>/DocumentSearch/SearchObject
+# We try the AtomSVC form first, then the bare form. Order matters — the first
+# non-404 response wins.
+_SEARCH_OBJECT_ROUTE_PREFIXES = ('/https', '')
+_SEARCH_OBJECT_OPERATION = '/DocumentSearch/SearchObject'
+# Result mode 1 returns full document property rows (matches the docs sample).
+# Mode 0 returns a schema-only / minimal result on most installations.
+_SEARCH_RESULT_MODE_DEFAULT = 1
+# Date filter field. CREATED_ON is universal (set on every document); APPROVED_ON
+# is only set for approved docs and is NULL for many results.
+_SEARCH_DATE_FIELD = 'CREATED_ON'
+
+
 def search_documents(
     cfg: WrenchConfig,
     *,
@@ -185,7 +397,7 @@ def search_documents(
 ) -> dict:
     """
     Search Wrench documents using the SearchObject API.
-    POST <<SVC URL>>/DocumentSearch/SearchObject
+    POST <<SVC URL>>/https/DocumentSearch/SearchObject  (per SmartProject docs)
 
     Returns the parsed response dict with:
       - 'total': int
@@ -197,11 +409,12 @@ def search_documents(
     search_criteria = []
     criterion_id = 1
 
-    # Date range filter (APPROVED_ON  Operator 4=GT, 5=LT)
+    # Date range filter (Operator 4=GT, 5=LT). Field is soft-coded — see
+    # _SEARCH_DATE_FIELD. The docs sample uses CREATED_ON.
     if date_from:
         search_criteria.append({
             'ProcessID': criterion_id,
-            'FieldName': 'APPROVED_ON',
+            'FieldName': _SEARCH_DATE_FIELD,
             'FieldValue': date_from,
             'Operator': 4,
             'RangeId': 0,
@@ -210,7 +423,7 @@ def search_documents(
     if date_to:
         search_criteria.append({
             'ProcessID': criterion_id,
-            'FieldName': 'APPROVED_ON',
+            'FieldName': _SEARCH_DATE_FIELD,
             'FieldValue': date_to,
             'Operator': 5,
             'RangeId': 0,
@@ -244,21 +457,24 @@ def search_documents(
         })
         criterion_id += 1
 
-    # Fields we want returned
+    # Fields we want returned. Per the SmartProject docs sample request,
+    # ObjectSearchFilterDetails must be a SINGLE entry whose FieldName is a
+    # comma-separated list of column names — not one entry per field.
     RETURN_FIELDS = [
+        'FILE_ID', 'ORIGINAL_F_NAME',
         'DOC_NO', 'DOC_DESCRIPTION', 'ORDER_NO', 'ORDER_DESCRIPTION',
         'GENEALOGY_STRING', 'CREATED_BY_USER', 'WF_TEAM_NAME', 'IDOC_ID',
-        'DOC_TYPE', 'IS_DEPENDENT', 'APPROVED_ON',
+        'DOC_TYPE', 'IS_DEPENDENT', _SEARCH_DATE_FIELD,
     ]
-    filter_fields = [
-        {'ProcessID': i + 1, 'FieldName': f}
-        for i, f in enumerate(RETURN_FIELDS)
-    ]
+    filter_fields = [{
+        'ProcessID': 1,
+        'FieldName': ','.join(RETURN_FIELDS),
+    }]
 
     payload = {
         'SearchObjectType': 0,
         'SearchType': 0,
-        'SearchResultMode': 0,
+        'SearchResultMode': _SEARCH_RESULT_MODE_DEFAULT,
         'ObjectSearchDetails': [{
             'ProcessID': 1,
             'RowCount': page_size,
@@ -276,36 +492,20 @@ def search_documents(
     }
 
     # ── Build candidate base URLs to try in order ─────────────────────────────
-    # API ref (SmartProject API - Rejlers R0.pdf):
-    #   SearchObject lives at  <<SVC URL>>/DocumentSearch/SearchObject
-    #   – SVC URL is the DocumentSearch service host, which is DIFFERENT from the
-    #     WebAPI Server URL that contains an application path (e.g. /WrenchWebAPI_Rejlers_Live).
-    #
-    # When no svc_url is configured we derive candidates from base_url intelligently:
-    #  1. scheme+host only  → e.g. https://rejlers.wrenchsp.com
-    #     (DocumentSearch usually lives at the root, not under the WebAPI sub-path)
-    #  2. full base_url     → e.g. https://rejlers.wrenchsp.com/WrenchWebAPI_Rejlers_Live
-    #     (fallback for single-server installs where both services share the same path)
-    # When svc_url IS configured, only that URL is used (admin override takes priority).
-    _SEARCH_OBJECT_SUFFIX = '/DocumentSearch/SearchObject'
-
-    if cfg.svc_url:
-        url_candidates = [cfg.svc_url.rstrip('/')]
-    else:
-        parsed      = urlparse(cfg.base_url)
-        host_root   = f"{parsed.scheme}://{parsed.netloc}"
-        full_base   = cfg.base_url.rstrip('/')
-        # Deduplicate (single-server where base_url has no path produces duplicates)
-        seen = set()
-        url_candidates = []
-        for c in [host_root, full_base]:
-            if c not in seen:
-                seen.add(c)
-                url_candidates.append(c)
+    # Soft-coded auto-discovery: the SVC host typically uses well-known patterns
+    # derived from the WebAPI base_url. Admin-set svc_url always wins.
+    url_candidates = build_svc_url_candidates(cfg)
 
     last_404_url = None
-    for search_base in url_candidates:
-        url = f"{search_base}{_SEARCH_OBJECT_SUFFIX}"
+    # Try each (base, route_prefix) combination. SmartProject AtomSVC installs
+    # require '/https' before the operation; legacy direct mounts use ''.
+    search_targets = [
+        (base, prefix)
+        for base in url_candidates
+        for prefix in _SEARCH_OBJECT_ROUTE_PREFIXES
+    ]
+    for search_base, route_prefix in search_targets:
+        url = f"{search_base}{route_prefix}{_SEARCH_OBJECT_OPERATION}"
         logger.info(
             '[Wrench] Searching documents: POST %s (page=%d, size=%d)', url, page, page_size
         )
@@ -345,21 +545,335 @@ def search_documents(
             'error_msg': data.get('ErrorMsg'),
         }
 
+    # ── OData / AtomSVC fallback ─────────────────────────────────────────────
+    # Some SmartProject installations (e.g. rejlers.wrenchsp.com) expose
+    # documents only through the WCF/OData layer at <svc>/AtomSVC.svc/, and not
+    # via the JSON /DocumentSearch/SearchObject route. When the JSON route is
+    # exhausted, attempt an OData query against the configured base.
+    # This is purely additive — JSON search core logic above is untouched.
+    if cfg.svc_url:
+        try:
+            odata_result = _search_documents_via_odata(
+                cfg,
+                page=page,
+                page_size=page_size,
+                doc_no=doc_no,
+                discipline=discipline,
+                doc_type=doc_type,
+                date_from=date_from,
+                date_to=date_to,
+                order_no=order_no,
+            )
+            if odata_result is not None:
+                return odata_result
+        except _ODataNotApplicable:
+            # Configured svc_url isn't an OData service — fall through to error.
+            pass
+        except Exception as exc:  # noqa: BLE001 - surface OData errors clearly
+            logger.warning('[Wrench] OData fallback failed: %s', exc)
+            raise RuntimeError(
+                f'Document search failed via both JSON SearchObject and OData fallback. '
+                f'OData error: {exc}'
+            ) from exc
+
     # All candidates exhausted — raise a helpful error
     if cfg.svc_url:
         raise RuntimeError(
             f'DocumentSearch endpoint not found at the configured SVC URL '
-            f'({cfg.svc_url.rstrip("/")}{_SEARCH_OBJECT_SUFFIX}). '
+            f'({cfg.svc_url.rstrip("/")}{_SEARCH_OBJECT_OPERATION}). '
             'Verify the URL in Configuration → "Document Search Service URL" is correct.'
         )
     # No svc_url – guide the user: auto-discovery failed, manual entry needed
-    tried = ', '.join(f'{c}{_SEARCH_OBJECT_SUFFIX}' for c in url_candidates)
+    tried = ', '.join(
+        f'{c}{prefix}{_SEARCH_OBJECT_OPERATION}'
+        for c in url_candidates
+        for prefix in _SEARCH_OBJECT_ROUTE_PREFIXES
+    )
     raise RuntimeError(
         f'Could not find the DocumentSearch endpoint. Tried: {tried}. '
         'The DocumentSearch service may run on a dedicated host separate from the WebAPI. '
         'Ask your Wrench admin for the "SVC URL" and add it in '
         'Configuration → "Document Search Service URL".'
     )
+
+
+# ─── Soft-coded OData / AtomSVC fallback (additive) ─────────────────────────
+# Activated only when JSON DocumentSearch is unavailable AND cfg.svc_url is set.
+# Many SmartProject installations expose documents at <svc>/AtomSVC.svc/<EntitySet>.
+# All constants below are soft-coded so admins can extend without touching logic.
+_ATOMSVC_SUFFIX = '/AtomSVC.svc'
+# Common OData entity-set names that hold the document index. Tried in order.
+_ODATA_DOCUMENT_ENTITY_SETS = [
+    'Documents',
+    'DocumentMaster',
+    'DocumentRevisions',
+    'WrenchDocuments',
+    'IDocs',
+    'DocumentList',
+]
+# Filterable OData fields → SmartProject column names
+_ODATA_FILTER_FIELD_MAP = {
+    'doc_no':     'DOC_NO',
+    'discipline': 'DISCIPLINE',
+    'order_no':   'ORDER_NO',
+    'doc_type':   'DOC_TYPE',
+    'date_from':  'APPROVED_ON',
+    'date_to':    'APPROVED_ON',
+}
+_ODATA_TIMEOUT = 60
+
+
+class _ODataNotApplicable(Exception):
+    """Raised when OData fallback cannot be used for this configuration."""
+    pass
+
+
+def _resolve_atomsvc_base(cfg: WrenchConfig) -> str:
+    """
+    Build the AtomSVC.svc base URL from cfg.svc_url.
+    cfg.svc_url has already been normalised (AtomSVC.svc stripped) so we re-add it.
+    """
+    if not cfg.svc_url:
+        raise _ODataNotApplicable('No svc_url configured')
+    base = cfg.svc_url.rstrip('/')
+    return f'{base}{_ATOMSVC_SUFFIX}'
+
+
+def _odata_quote(value: str) -> str:
+    """OData v3 string-literal escape: doubled single-quotes."""
+    return str(value).replace("'", "''")
+
+
+def _build_odata_filter(*, doc_no=None, discipline=None, doc_type=None,
+                       date_from=None, date_to=None, order_no=None) -> str:
+    """Compose a SmartProject-friendly OData $filter clause from search args."""
+    clauses = []
+    if doc_no:
+        clauses.append(
+            f"substringof('{_odata_quote(doc_no)}',{_ODATA_FILTER_FIELD_MAP['doc_no']})"
+        )
+    if discipline:
+        clauses.append(
+            f"{_ODATA_FILTER_FIELD_MAP['discipline']} eq '{_odata_quote(discipline)}'"
+        )
+    if doc_type:
+        clauses.append(
+            f"{_ODATA_FILTER_FIELD_MAP['doc_type']} eq '{_odata_quote(doc_type)}'"
+        )
+    if order_no:
+        clauses.append(
+            f"{_ODATA_FILTER_FIELD_MAP['order_no']} eq '{_odata_quote(order_no)}'"
+        )
+    if date_from:
+        clauses.append(
+            f"{_ODATA_FILTER_FIELD_MAP['date_from']} ge '{_odata_quote(date_from)}'"
+        )
+    if date_to:
+        clauses.append(
+            f"{_ODATA_FILTER_FIELD_MAP['date_to']} le '{_odata_quote(date_to)}'"
+        )
+    return ' and '.join(clauses)
+
+
+def _odata_discover_entity_sets(odata_base: str, token: str) -> list:
+    """
+    GET <odata_base>/  → AtomPub or OData JSON service document.
+    Extract entity-set names; fall back to soft-coded list if not parseable.
+    """
+    headers = {'Accept': 'application/json'}
+    params = {'TOKEN': token} if token else {}
+    try:
+        resp = requests.get(odata_base + '/', headers=headers, params=params, timeout=15)
+    except requests.exceptions.RequestException as exc:
+        logger.debug('[Wrench OData] discovery GET failed: %s', exc)
+        return list(_ODATA_DOCUMENT_ENTITY_SETS)
+    if resp.status_code == 404:
+        raise _ODataNotApplicable(f'AtomSVC.svc not found at {odata_base}')
+    if not resp.ok:
+        return list(_ODATA_DOCUMENT_ENTITY_SETS)
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            d = data.get('d', data)
+            if isinstance(d, dict):
+                sets = d.get('EntitySets')
+                if isinstance(sets, list) and sets:
+                    return [s for s in sets if isinstance(s, str)]
+            value = data.get('value')
+            if isinstance(value, list) and value:
+                names = [v.get('name') for v in value if isinstance(v, dict) and v.get('name')]
+                if names:
+                    return names
+    except ValueError:
+        # AtomPub XML — fall through to soft-coded list.
+        pass
+    return list(_ODATA_DOCUMENT_ENTITY_SETS)
+
+
+def _search_documents_via_odata(
+    cfg: WrenchConfig,
+    *,
+    page: int = 1,
+    page_size: int = 50,
+    doc_no: str = None,
+    discipline: str = None,
+    doc_type: str = None,
+    date_from: str = None,
+    date_to: str = None,
+    order_no: str = None,
+) -> dict:
+    """
+    Query documents via the OData/AtomPub layer at <svc>/AtomSVC.svc/.
+    Returns same shape as `search_documents`, with extra 'source': 'odata'.
+    Raises _ODataNotApplicable when the service is absent (404 on root).
+    """
+    odata_base = _resolve_atomsvc_base(cfg)
+    token = _ensure_token(cfg)
+
+    entity_sets = _odata_discover_entity_sets(odata_base, token)
+
+    skip = max((page - 1) * page_size, 0)
+    base_params = {
+        '$top':         page_size,
+        '$skip':        skip,
+        '$format':      'json',
+        '$inlinecount': 'allpages',
+    }
+    filter_str = _build_odata_filter(
+        doc_no=doc_no, discipline=discipline, doc_type=doc_type,
+        date_from=date_from, date_to=date_to, order_no=order_no,
+    )
+    if filter_str:
+        base_params['$filter'] = filter_str
+
+    last_status = None
+    for entity in entity_sets:
+        url = f'{odata_base}/{entity}'
+        params = dict(base_params)
+        if token:
+            params['TOKEN'] = token
+        logger.info('[Wrench OData] GET %s (page=%d, size=%d)', url, page, page_size)
+        try:
+            resp = requests.get(
+                url,
+                params=params,
+                headers={'Accept': 'application/json'},
+                timeout=_ODATA_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as exc:
+            logger.debug('[Wrench OData] %s failed: %s', url, exc)
+            continue
+        last_status = resp.status_code
+        if resp.status_code == 404:
+            continue
+        if not resp.ok:
+            raise RuntimeError(
+                f'OData query to {url} returned HTTP {resp.status_code}: {resp.text[:200]}'
+            )
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise RuntimeError(f'OData response from {url} is not JSON: {exc}')
+
+        if isinstance(data, dict):
+            _refresh_token_from_response(cfg, data)
+
+        documents = []
+        total = None
+        if isinstance(data, dict):
+            d = data.get('d', data)
+            if isinstance(d, dict):
+                results = d.get('results')
+                if isinstance(results, list):
+                    documents = results
+                count = d.get('__count')
+                if count is not None:
+                    try:
+                        total = int(count)
+                    except (TypeError, ValueError):
+                        total = None
+            if not documents and isinstance(data.get('value'), list):
+                documents = data['value']
+            if total is None and data.get('@odata.count') is not None:
+                try:
+                    total = int(data['@odata.count'])
+                except (TypeError, ValueError):
+                    pass
+
+        cleaned_docs = []
+        for row in documents:
+            if isinstance(row, dict):
+                cleaned_docs.append({k: v for k, v in row.items() if not str(k).startswith('__')})
+        if total is None:
+            total = len(cleaned_docs)
+
+        return {
+            'total':            total,
+            'documents':        cleaned_docs,
+            'operation_status': 0,
+            'error_msg':        None,
+            'source':           'odata',
+        }
+
+    if last_status is None:
+        raise _ODataNotApplicable(f'AtomSVC.svc unreachable at {odata_base}')
+    raise RuntimeError(
+        f'OData fallback could not locate a document entity set under {odata_base}/. '
+        f'Tried: {", ".join(entity_sets)}. Ask your Wrench admin which OData '
+        f'collection holds the document index.'
+    )
+
+
+def probe_svc_url_candidates(cfg: WrenchConfig) -> dict:
+    """
+    Auto-discovery probe — used by the "Auto-Detect" button on the config form.
+    For each candidate base URL, check whether `/DocumentSearch/SearchObject`
+    responds with anything other than 404 / DNS failure. The first reachable
+    one is returned as the recommended svc_url.
+
+    Note: this only validates *reachability* — it does NOT log into Wrench or
+    submit a real search payload. Core search logic is untouched.
+
+    Returns:
+      {
+        'recommended': str | None,    # First reachable candidate (or None)
+        'candidates': [
+          { 'url': str, 'reachable': bool, 'status_code': int|None, 'note': str }
+        ]
+      }
+    """
+    _PROBE_TIMEOUT = 6  # seconds — keep UI responsive
+    _SEARCH_OBJECT_SUFFIX = '/DocumentSearch/SearchObject'
+
+    candidates = build_svc_url_candidates(cfg)
+    results = []
+    recommended = None
+
+    for base in candidates:
+        url = f"{base}{_SEARCH_OBJECT_SUFFIX}"
+        entry = {'url': base, 'probe_url': url, 'reachable': False, 'status_code': None, 'note': ''}
+        try:
+            # POST with an empty body — a real DocumentSearch endpoint will reply
+            # with 400/401/500 (auth/payload error) but NOT 404. DNS / connection
+            # failures bubble up as ConnectionError.
+            resp = requests.post(url, json={}, timeout=_PROBE_TIMEOUT)
+            entry['status_code'] = resp.status_code
+            if resp.status_code == 404:
+                entry['note'] = 'Endpoint not found'
+            else:
+                entry['reachable'] = True
+                entry['note'] = f'Reachable (HTTP {resp.status_code})'
+                if recommended is None:
+                    recommended = base
+        except requests.exceptions.ConnectionError:
+            entry['note'] = 'DNS / connection failed'
+        except requests.exceptions.Timeout:
+            entry['note'] = f'Timed out after {_PROBE_TIMEOUT}s'
+        except requests.exceptions.RequestException as exc:
+            entry['note'] = f'Request error: {type(exc).__name__}'
+        results.append(entry)
+
+    return {'recommended': recommended, 'candidates': results}
 
 
 # ─── Soft-coded constants for document file download ─────────────────────────
@@ -532,6 +1046,96 @@ def _flatten_doc_rows(raw_list: list) -> list:
     return documents
 
 
+# ─── Soft-coded transmittal-as-document fallback ─────────────────────────────
+# Some Wrench tenants (including Rejlers Live) do not expose any per-transmittal
+# document endpoint, and DocumentSearch returns zero rows. In that case the
+# transmittal rows themselves carry enough metadata to *be* documents:
+#   • TRANS_REF_NO       → unique document number
+#   • TRANS_DESC         → document title (falls back to TRANS_TYPE_CODE)
+#   • REPORT_FILE_ID     → file identifier for download
+#   • STATUS_DESC        → revision/status
+#   • CREATED_ON         → date
+# This helper synthesizes a documents[] payload from the transmittal list,
+# keyed by ORDER_NO. It is invoked by the view layer ONLY when the existing
+# core strategies return zero documents — core logic in get_transmittal_documents
+# stays untouched.
+_TRANSMITTAL_DOC_FIELD_MAP = {
+    'DOC_NO':          ('TRANS_REF_NO',  'TRANS_ID'),
+    'DOC_DESCRIPTION': ('TRANS_DESC',    'TRANS_TYPE_CODE', 'ORDER_DESCRIPTION'),
+    'REVISION':        ('STATUS_DESC',   'REV_SERIES_ID'),
+    'DOC_DATE':        ('CREATED_ON',    'RELEASED_ON'),
+    'FILE_ID':         ('REPORT_FILE_ID',),
+    'DISCIPLINE':      ('TRANS_TYPE_CODE',),
+    'ORDER_NO':        ('ORDER_NO',),
+    'TRANS_ID':        ('TRANS_ID',),
+}
+# Document number prefixes that strongly suggest a P&ID-related drawing.
+# Used downstream by the recommender; harmless if no match.
+_TRANSMITTAL_FALLBACK_MAX_ROWS = 200_000   # large slice covers the full tenant in one call
+                                            # (upstream API returns everything in a single page anyway)
+
+
+def _row_first_nonempty(row: dict, keys: tuple) -> str:
+    for k in keys:
+        v = row.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ''
+
+
+def synthesize_documents_from_transmittal_list(
+    cfg: WrenchConfig,
+    *,
+    order_no: str,
+    page: int = 1,
+    page_size: int = 200,
+) -> dict:
+    """
+    Synthesize a documents[] payload by filtering the transmittal list to a
+    given ORDER_NO. Used as a last-resort fallback when neither per-transmittal
+    REST endpoints nor DocumentSearch return any rows.
+
+    Returns the same shape as `get_transmittal_documents`:
+      { 'total', 'documents', 'source': 'transmittal_list', 'page', 'page_size' }
+    """
+    tx = get_transmittals(cfg, page=1, page_size=_TRANSMITTAL_FALLBACK_MAX_ROWS)
+    all_rows = tx.get('transmittals') or []
+    matching = [r for r in all_rows
+                if (str(r.get('ORDER_NO') or '').strip() == str(order_no).strip())]
+
+    documents = []
+    for row in matching:
+        synth = {}
+        for out_key, src_keys in _TRANSMITTAL_DOC_FIELD_MAP.items():
+            synth[out_key] = _row_first_nonempty(row, src_keys)
+        # Keep the original raw row under a discoverable key for the recommender.
+        synth['_raw_transmittal'] = row
+        documents.append(synth)
+
+    # Apply pagination on the synthesized list.
+    total = len(documents)
+    start = max(0, (page - 1) * page_size)
+    end   = start + page_size
+    page_slice = documents[start:end]
+
+    logger.info(
+        '[Wrench] transmittal-as-document fallback: %d transmittals for ORDER_NO=%s → %d synthesized docs',
+        len(matching), order_no, total,
+    )
+
+    return {
+        'total':            total,
+        'documents':        page_slice,
+        'source':           'transmittal_list',
+        'page':             page,
+        'page_size':        page_size,
+        'svc_url_required': False,
+    }
+
+
 def get_transmittal_documents(
     cfg: WrenchConfig,
     *,
@@ -566,84 +1170,97 @@ def get_transmittal_documents(
     if trans_id:
         base_payload['TRANS_ID'] = trans_id
 
-    # ── Strategy 1: Transmittal-specific REST paths ───────────────────────────
-    for path in _TRANS_DOC_REST_PATHS:
+    # ── Soft-coded fast-path via per-host capability cache ───────────────────
+    # Skip REST probing entirely when:
+    #   • we already learned all REST paths 404 for this host (within TTL), OR
+    #   • we remember a winning path → try it FIRST (and only it from strategy 1+2)
+    import time as _time
+    profile        = _host_profile(cfg)
+    dead_paths     = profile['dead_paths']
+    winning_path   = profile['winning_path']
+    exhausted_until = profile['exhausted_until']
+    skip_rest      = (exhausted_until and _time.time() < exhausted_until)
+
+    # Build the ordered REST candidate list, honouring cache hints
+    strategy1_paths = list(_TRANS_DOC_REST_PATHS)
+    strategy2_paths = [_DOC_LIST_URL_PATH] + list(_DOC_LIST_ALT_PATHS)
+    if winning_path:
+        # Try winner first; remove duplicates further down the list
+        if winning_path in strategy1_paths:
+            strategy1_paths = [winning_path] + [p for p in strategy1_paths if p != winning_path]
+        elif winning_path in strategy2_paths:
+            strategy2_paths = [winning_path] + [p for p in strategy2_paths if p != winning_path]
+
+    def _attempt_rest(path: str, timeout: int) -> dict | None:
+        """Returns a result dict on success, None on 404/error (so caller continues)."""
+        if path in dead_paths:
+            return None
         url = _api_url(cfg, path)
-        logger.info('[Wrench] get_transmittal_documents: trying %s (order_no=%s)', url, order_no)
         try:
-            resp = requests.post(url, json=base_payload, timeout=_TIMEOUT_SEARCH)
+            resp = requests.post(url, json=base_payload, timeout=timeout)
             if resp.status_code == 404:
-                logger.debug('[Wrench] %s → 404, trying next', url)
-                continue
+                dead_paths.add(path)
+                logger.debug('[Wrench] %s → 404 (cached as dead)', url)
+                return None
             resp.raise_for_status()
             data = resp.json()
             _refresh_token_from_response(cfg, data)
-
-            # Try each candidate DataList key
             raw_list = []
             for key in _TRANS_DOC_DATA_KEYS:
                 raw_list = data.get('DataList', {}).get(key, [])
                 if raw_list:
-                    logger.info('[Wrench] found %d doc rows under DataList.%s', len(raw_list), key)
                     break
-
-            # Also check top-level lists in case the response is unwrapped
             if not raw_list:
-                raw_list = data.get('DocumentList', [])
-            if not raw_list:
-                raw_list = data.get('ObjectSearchResults', [])
-
+                raw_list = (
+                    data.get('DataList', {}).get(_DOC_LIST_DATA_KEY, [])
+                    or data.get('DataList', {}).get('DOCUMENT', [])
+                    or data.get('DocumentList', [])
+                    or data.get('ObjectSearchResults', [])
+                )
             documents = _flatten_doc_rows(raw_list)
-
-            # Accept empty list as valid success — the transmittal may genuinely have no docs
             total = len(documents)
             start = (page - 1) * page_size
+            profile['winning_path'] = path           # remember success
+            profile['exhausted_until'] = 0.0
             return {
                 'total':     total,
                 'documents': documents[start: start + page_size],
                 'source':    f'rest:{path}',
             }
-
         except requests.exceptions.HTTPError as exc:
             logger.debug('[Wrench] HTTP error on %s: %s', url, exc)
-            continue
+            return None
         except Exception as exc:
             logger.debug('[Wrench] Unexpected error on %s: %s', url, exc)
-            continue
+            return None
 
-    # ── Strategy 2: Generic Document list endpoint (GetDocumentList + alts) ──
-    doc_list_paths = [_DOC_LIST_URL_PATH] + _DOC_LIST_ALT_PATHS
-    for path in doc_list_paths:
-        url = _api_url(cfg, path)
-        logger.info('[Wrench] get_transmittal_documents: fallback to %s', url)
-        try:
-            resp = requests.post(url, json=base_payload, timeout=_TIMEOUT_SEARCH)
-            if resp.status_code == 404:
-                logger.debug('[Wrench] %s → 404', url)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            _refresh_token_from_response(cfg, data)
+    if not skip_rest:
+        # ── Strategy 1: Transmittal-specific REST paths ──────────────────────
+        for path in strategy1_paths:
+            result = _attempt_rest(path, _TIMEOUT_PROBE if winning_path != path else _TIMEOUT_SEARCH)
+            if result is not None:
+                return result
 
-            raw_list = (
-                data.get('DataList', {}).get(_DOC_LIST_DATA_KEY, [])
-                or data.get('DataList', {}).get('DOCUMENT', [])
-                or data.get('DocumentList', [])
-            )
-            documents = _flatten_doc_rows(raw_list)
-            total = len(documents)
-            start = (page - 1) * page_size
-            return {
-                'total':     total,
-                'documents': documents[start: start + page_size],
-                'source':    f'rest:{path}',
-            }
-        except Exception as exc:
-            logger.debug('[Wrench] Doc-list fallback error on %s: %s', url, exc)
-            continue
+        # ── Strategy 2: Generic Document list endpoints ──────────────────────
+        for path in strategy2_paths:
+            result = _attempt_rest(path, _TIMEOUT_PROBE if winning_path != path else _TIMEOUT_SEARCH)
+            if result is not None:
+                return result
+
+        # All REST paths failed → mark host as exhausted to skip probes for TTL
+        profile['exhausted_until'] = _time.time() + _TRANS_DOC_EXHAUSTED_TTL_SECONDS
+        logger.info(
+            '[Wrench] All REST trans-doc paths failed for host; caching exhausted state for %ds',
+            _TRANS_DOC_EXHAUSTED_TTL_SECONDS,
+        )
+    else:
+        logger.info(
+            '[Wrench] Skipping REST trans-doc probing (host previously exhausted; %.0fs remain)',
+            exhausted_until - _time.time(),
+        )
 
     # ── Strategy 3: DocumentSearch/SearchObject with ORDER_NO criterion ───────
-    logger.info('[Wrench] get_transmittal_documents: all REST paths failed, trying DocumentSearch (order_no=%s)', order_no)
+    logger.info('[Wrench] get_transmittal_documents: trying DocumentSearch fallback (order_no=%s)', order_no)
     try:
         result = search_documents(cfg, page=page, page_size=page_size, order_no=order_no)
         result['source'] = 'document_search'
@@ -654,7 +1271,7 @@ def get_transmittal_documents(
     raise RuntimeError(
         f'No Wrench endpoint returned document data for transmittal ORDER_NO={order_no}. '
         f'Tried transmittal-specific paths ({_TRANS_DOC_REST_PATHS}), '
-        f'generic document paths ({doc_list_paths}), and DocumentSearch. '
+        f'generic document paths ({[_DOC_LIST_URL_PATH] + list(_DOC_LIST_ALT_PATHS)}), and DocumentSearch. '
         'Check that the Wrench WebAPI exposes document listing, or configure a DocumentSearch SVC URL.'
     )
 
@@ -840,9 +1457,154 @@ def get_transmittals(
     }
 
 
+# ─── Soft-coded: Wrench project-library / folder-tree REST endpoints ─────────
+# Wrench SmartProject exposes the project's R:\Projects-style folder tree
+# under one of several REST paths depending on the deployment version. We try
+# each path in order and stop at the first one that returns folder rows. The
+# response shape across versions also varies — we accept any "FOLDER_LIST" /
+# "GENEALOGY_LIST" / "FOLDER" DataList key and any list-of-{FieldName,Value}
+# OR flat-dict row format (same as TRANSMITTAL_LIST).
+#
+# To add a new tenant-specific path, just append it here — no code change
+# elsewhere is required (soft-coded).
+_FOLDER_LIST_PATHS = [
+    '/api/Folder/GetFolderList',
+    '/api/Folder/GetFolderTree',
+    '/api/Folder/GetGenealogy',
+    '/api/ProjectLibrary/GetFolderList',
+    '/api/ProjectLibrary/GetFolderTree',
+    '/api/Document/GetFolderList',
+    '/api/Document/GetGenealogyList',
+    '/api/Genealogy/GetGenealogyList',
+    '/api/Library/GetFolderList',
+]
+_FOLDER_LIST_DATA_KEYS = [
+    'FOLDER_LIST', 'FolderList',
+    'GENEALOGY_LIST', 'GenealogyList',
+    'FOLDER', 'Folder',
+    'TREE', 'Tree',
+]
+# Candidate fields that hold the folder name within a row.
+_FOLDER_NAME_FIELDS = (
+    'FOLDER_NAME', 'FolderName', 'NAME', 'Name',
+    'FOLDER', 'Folder', 'TITLE', 'Title',
+    'GENEALOGY_NAME', 'GenealogyName',
+)
+# Candidate fields that hold the full path (slash-separated).
+_FOLDER_PATH_FIELDS = (
+    'GENEALOGY_STRING', 'GenealogyString',
+    'FOLDER_PATH', 'FolderPath',
+    'PATH', 'Path',
+    'FULL_PATH', 'FullPath',
+)
+
+
+def get_project_folder_tree(cfg: 'WrenchConfig', *, order_no: str) -> dict:
+    """
+    Return the Wrench project-library folder tree for `order_no`.
+
+    Tries each path in `_FOLDER_LIST_PATHS` against the main WebAPI host (no
+    SVC URL required). The first endpoint that returns a non-empty folder
+    list wins. Soft-coded so additional tenant-specific paths can be added
+    without changing call-sites.
+
+    Returns:
+      { 'folders': [ { 'path': 'Engineering', 'segments': ['Engineering'] }, ... ],
+        'source':  '<path>' | 'none',
+        'total':   N }
+    """
+    token = _ensure_token(cfg)
+    payload = {
+        'TOKEN':       token,
+        'SERVER_ID':   cfg.server_id,
+        'LOGIN_NAME':  cfg.login_name,
+        'ORDER_NO':    order_no,
+        'ROW_COUNT':   500,
+        'PAGE_NUMBER': 1,
+    }
+
+    def _row_to_path(row):
+        # Accept BOTH list-of-{FieldName,Value} and flat-dict row shapes.
+        flat = {}
+        if isinstance(row, list):
+            for f in row:
+                n = f.get('FieldName') or ''
+                if n:
+                    flat[n] = f.get('Value')
+        elif isinstance(row, dict):
+            flat = row
+        # Prefer an explicit full path.
+        for f in _FOLDER_PATH_FIELDS:
+            v = flat.get(f)
+            if v and str(v).strip():
+                return str(v).strip()
+        # Fall back to a single folder name.
+        for f in _FOLDER_NAME_FIELDS:
+            v = flat.get(f)
+            if v and str(v).strip():
+                return str(v).strip()
+        return ''
+
+    for path in _FOLDER_LIST_PATHS:
+        url = _api_url(cfg, path)
+        try:
+            resp = requests.post(url, json=payload, timeout=_TIMEOUT_SEARCH)
+        except Exception as exc:
+            logger.info('[Wrench] folder-tree %s → exception %s', path, exc)
+            continue
+        if resp.status_code == 404:
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            continue
+        _refresh_token_from_response(cfg, data)
+
+        raw = []
+        for key in _FOLDER_LIST_DATA_KEYS:
+            raw = data.get('DataList', {}).get(key) or data.get(key) or []
+            if raw:
+                break
+        if not raw:
+            continue
+
+        folders = []
+        seen = set()
+        for row in raw:
+            p = _row_to_path(row)
+            if not p:
+                continue
+            # Normalise separators → forward slash and trim leading/trailing.
+            normalised = re.sub(r'[\\>|]', '/', p).strip().strip('/')
+            if not normalised or normalised.lower() in seen:
+                continue
+            seen.add(normalised.lower())
+            segments = [s.strip() for s in normalised.split('/') if s.strip()]
+            if not segments:
+                continue
+            # Skip a leading segment that duplicates ORDER_NO.
+            if segments[0].strip().lower() == str(order_no).strip().lower():
+                segments = segments[1:]
+            if not segments:
+                continue
+            folders.append({
+                'path':     '/'.join(segments),
+                'segments': segments,
+            })
+        if folders:
+            logger.info('[Wrench] folder-tree: %s returned %d folders for ORDER_NO=%s',
+                        path, len(folders), order_no)
+            return {'folders': folders, 'source': path, 'total': len(folders)}
+
+    return {'folders': [], 'source': 'none', 'total': 0}
+
+
 # ─── Soft-coded: max transmittals to expand when no direct document endpoint exists ──
 # Increase to search more transmittals (slower); decrease for faster but narrower results.
 _MAX_TRANS_FOR_DOC_EXPANSION  = 15
+
+
+
 # Per-transmittal HTTP timeout (seconds). Short because these fire in parallel.
 _TRANS_EXPAND_CALL_TIMEOUT    = 10
 # Parallel worker cap — avoids overwhelming the Wrench server.

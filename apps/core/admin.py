@@ -1,5 +1,15 @@
 from django.contrib import admin
 from apps.core.project_models import Project, ProjectMember, ProjectTask, ProjectMilestone
+from apps.core.models import Enquiry
+
+
+@admin.register(Enquiry)
+class EnquiryAdmin(admin.ModelAdmin):
+    list_display = ['id', 'name', 'email', 'company', 'subject', 'service', 'urgency', 'status', 'created_at']
+    list_filter = ['status', 'urgency', 'service', 'created_at']
+    search_fields = ['name', 'email', 'company', 'subject', 'message']
+    readonly_fields = ['created_at', 'updated_at', 'source_ip', 'user_agent']
+    list_per_page = 50
 
 
 @admin.register(Project)

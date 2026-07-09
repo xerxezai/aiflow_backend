@@ -82,6 +82,21 @@ class NotificationService:
             'action_label': 'View Results',
         },
         
+        # Payroll Templates
+        'PAYROLL_FROZEN': {
+            'title': '\U0001f9ca Payroll File Frozen — Awaiting HR Approval',
+            'message': (
+                'The {period} master payroll file has been frozen by {frozen_by}. '
+                '{total_rows} employee records are locked. '
+                'Please review and proceed with HR approval.'
+            ),
+            'priority': 'HIGH',
+            'category': 'APPROVAL',
+            'send_email': True,
+            'action_label': 'Open Payroll Engine',
+            'action_url': '/hr/payroll',
+        },
+
         # System Templates
         'SYSTEM_MAINTENANCE': {
             'title': '🔧 System Maintenance Scheduled',
@@ -99,7 +114,20 @@ class NotificationService:
             'category': 'USER',
             'send_email': True,
             'action_label': 'Update Profile',
-        }
+        },
+
+        # Enquiry / Password Reset Templates
+        'ENQUIRY_PASSWORD_RESET_REQUEST': {
+            'title': '🔐 Password Reset Request',
+            'message': (
+                '{user_email} has requested a password reset. '
+                'Please verify identity and reset via User Management.'
+            ),
+            'priority': 'HIGH',
+            'category': 'USER',
+            'action_label': 'Open Enquiries',
+            'action_url': '/admin/enquiries',
+        },
     }
     
     @classmethod

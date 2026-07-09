@@ -46,17 +46,33 @@ DATE_PATTERN = re.compile(
     r'\b(\d{4}-\d{2}-\d{2}|\d{2}[./]\d{2}[./]\d{4}|\d{2}-[A-Z]{3}-\d{4})\b'
 )
 
-# Discipline keywords
+# Discipline keywords — soft-coded; longest / most-specific tokens first so
+# 'instrumentation' wins over 'instrument' when iterated in order.
+# Values use the canonical taxonomy keys from document_taxonomy.json
+# wherever a one-to-one mapping exists, so downstream code sees a value
+# the sanitiser will accept without remapping.
 DISCIPLINE_KEYWORDS = {
-    'process': 'Process',
-    'instrument': 'Instrument',
-    'electrical': 'Electrical',
-    'mechanical': 'Mechanical',
-    'piping': 'Piping',
-    'civil': 'Civil',
-    'structural': 'Structural',
-    'hvac': 'HVAC',
-    'safety': 'Safety',
+    'instrumentation': 'Instrumentation',
+    'telecommunication': 'TeleCommunication',
+    'architectural':   'Architectural',
+    'procurement':     'Procurement',
+    'inspection':      'Inspection',
+    'mechanical':      'Mechanical',
+    'electrical':      'Electrical',
+    'structural':      'Civil & Structural',
+    'pipeline':        'Pipeline',
+    'process':         'Process',
+    'piping':          'Piping',
+    'civil':           'Civil',
+    'hvac':            'HVAC',
+    'fire & gas':      'Fire & Gas',
+    'fire and gas':    'Fire & Gas',
+    'telecom':         'TeleCommunication',
+    'health':          'HSE',
+    'environment':     'HSE',
+    'safety':          'HSE',
+    'hse':             'HSE',
+    'instrument':      'Instrumentation',
 }
 
 # Mechanical component keywords
@@ -112,6 +128,145 @@ def _detect_status(text):
     return ''
 
 
+# ---------------------------------------------------------------------------
+# Taxonomy classification — soft-coded, reuses the Bulk Master Index
+# taxonomy matcher so single-file flow returns the SAME controlled-vocabulary
+# values (Civil Calculations, Equipment Miscellaneous, Vessel Design
+# Calculations, Pipeline Calculations, etc.) as the manual master index.
+# ---------------------------------------------------------------------------
+
+# Module-level soft-coded knobs.
+TAXONOMY_CONFIG = {
+    # When True, the file_name + folder path get priority over body text —
+    # this matches reviewer behaviour where the folder ("DESIGN CALCULATION
+    # (Utility & Offsite's)") drives the sub-type.
+    'priority_signal': 'filename_path',
+    # Maximum characters of body text scanned (keeps regex evaluation fast).
+    'max_body_chars': 20000,
+    # Fallback discipline → taxonomy type hint when the matcher returns
+    # ambiguous results. Soft-coded so it can be tuned without code edits.
+    # Values MUST be canonical taxonomy keys from document_taxonomy.json —
+    # anything else gets cleared to NA by _sanitize_document_type and the
+    # Document Type column ends up blank.
+    'discipline_to_type_hint': {
+        'Architectural':       'Architectural',
+        'Civil':               'Civil',
+        'Civil & Structural':  'Civil & Structural',
+        'Structural':          'Civil & Structural',
+        'Electrical':          'Electrical',
+        'Equipment':           'Equipment',
+        'Fire & Gas':          'Fire & Gas',
+        'HSE':                 'HSE',
+        'Safety':              'HSE',
+        'HVAC':                'HVAC',
+        'Inspection':          'Inspection',
+        'Instrumentation':     'Instrumentation',
+        'Instrument':          'Instrumentation',
+        'Material Management': 'Material Management',
+        'Mechanical':          'Mechanical',
+        'Pipeline':            'Pipeline',
+        'Piping':              'Piping',
+        'Process':             'Process',
+        'Procurement':         'Procurement',
+        'Quality Control':     'Quality Control',
+        'TeleCommunication':   'TeleCommunication',
+        'Telecommunication':   'TeleCommunication',
+        'Telecom':             'TeleCommunication',
+    },
+}
+
+
+def _classify_taxonomy_for_item(item, *, file_name, body_text):
+    """
+    Populate item['document_type'] and item['document_subtype'] using the
+    controlled taxonomy. Reuses master_index_service helpers so the matching
+    rules stay identical to the Bulk Master Index flow.
+
+    The lookup builds two corpora:
+      * priority_corpus = file_name (matches reviewer convention)
+      * full_corpus     = file_name + document_title + body_text (truncated)
+    """
+    try:
+        from apps.non_teff_metadata.services import master_index_service as mis
+    except Exception:
+        logger.exception('classify_taxonomy: could not import master_index_service')
+        return
+
+    try:
+        taxonomy = mis.load_taxonomy()
+    except Exception:
+        logger.exception('classify_taxonomy: load_taxonomy failed')
+        return
+
+    title = (item.get('document_title') or '').strip()
+    body  = (body_text or '')[:TAXONOMY_CONFIG['max_body_chars']]
+
+    priority_corpus = mis._normalise_corpus(file_name or '', title)
+    full_corpus     = mis._normalise_corpus(file_name or '', title, body)
+
+    sub, owner = mis._match_subtype_smart(
+        parent_type='',
+        corpus=full_corpus,
+        taxonomy=taxonomy,
+        priority_corpus=priority_corpus,
+    )
+
+    # Backfill document_type from matched owner, or from a discipline hint.
+    doc_type = owner or ''
+    if not doc_type:
+        disc = (item.get('discipline') or '').strip()
+        doc_type = TAXONOMY_CONFIG['discipline_to_type_hint'].get(disc, '')
+
+    # Snap free-text type to the canonical taxonomy key when possible.
+    doc_type = mis._sanitize_document_type(doc_type, sub, taxonomy) or doc_type
+
+    item['document_type']    = doc_type or item.get('document_type', '')
+    item['document_subtype'] = sub or item.get('document_subtype', '')
+
+
+def _build_body_text(file_path, file_format):
+    """Read a capped text representation of the source file for classifier
+    context. Returns '' on any failure — classifier still works from
+    file_name + title alone."""
+    cap = TAXONOMY_CONFIG['max_body_chars']
+    try:
+        if file_format == 'pdf':
+            import pdfplumber
+            chunks = []
+            with pdfplumber.open(file_path) as pdf:
+                for page in pdf.pages[:5]:  # title block usually on first pages
+                    t = page.extract_text() or ''
+                    chunks.append(t)
+                    if sum(len(c) for c in chunks) >= cap:
+                        break
+            return ' '.join(chunks)[:cap]
+        if file_format == 'excel':
+            import openpyxl
+            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+            buf = []
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(max_row=50, values_only=True):
+                    for c in row:
+                        if c:
+                            buf.append(str(c))
+                    if sum(len(b) for b in buf) >= cap:
+                        return ' '.join(buf)[:cap]
+            return ' '.join(buf)[:cap]
+        if file_format == 'word':
+            import docx
+            d = docx.Document(file_path)
+            buf = []
+            for p in d.paragraphs[:200]:
+                if p.text:
+                    buf.append(p.text)
+                if sum(len(b) for b in buf) >= cap:
+                    break
+            return ' '.join(buf)[:cap]
+    except Exception:
+        logger.debug('build_body_text failed for %s', file_path, exc_info=True)
+    return ''
+
+
 def _extract_fields_from_text(text, source_label=''):
     """
     Run all field extractors against a block of text.
@@ -120,6 +275,8 @@ def _extract_fields_from_text(text, source_label=''):
     return {
         'document_no': _all_matches(DOCUMENT_NO_PATTERN, text),
         'document_title': '',         # filled from structured sources below
+        'document_type': '',          # filled by taxonomy classifier (see classify_taxonomy)
+        'document_subtype': '',       # filled by taxonomy classifier (see classify_taxonomy)
         'revision': _first_match(REVISION_PATTERN, text),
         'discipline': _detect_discipline(text),
         'instrument_tag_no': _all_matches(INSTRUMENT_TAG_PATTERN, text),
@@ -139,7 +296,10 @@ def _merge_results(results):
     Multi-value fields are deduplicated and joined.
     """
     merged = {k: set() for k in results[0]} if results else {}
-    scalar_keys = {'revision', 'date', 'originator', 'document_title', 'remarks'}
+    scalar_keys = {
+        'revision', 'date', 'originator', 'document_title', 'remarks',
+        'document_type', 'document_subtype',
+    }
 
     for r in results:
         for k, v in r.items():
@@ -198,6 +358,15 @@ def extract_from_excel(file_path):
         'doc. no.': 'document_no',
         'document title': 'document_title',
         'title': 'document_title',
+        'document type': 'document_type',
+        'doc type': 'document_type',
+        'doc. type': 'document_type',
+        'document sub-type': 'document_subtype',
+        'document subtype': 'document_subtype',
+        'doc sub-type': 'document_subtype',
+        'doc. sub-type': 'document_subtype',
+        'sub-type': 'document_subtype',
+        'subtype': 'document_subtype',
         'rev': 'revision',
         'revision': 'revision',
         'discipline': 'discipline',
@@ -246,7 +415,8 @@ def extract_from_excel(file_path):
             # Map each data row to a result dict
             for row in ws.iter_rows(values_only=True):
                 rec = {k: '' for k in [
-                    'document_no', 'document_title', 'revision', 'discipline',
+                    'document_no', 'document_title', 'document_type', 'document_subtype',
+                    'revision', 'discipline',
                     'instrument_tag_no', 'line_number', 'equipment_no',
                     'mechanical_component', 'status', 'date', 'originator', 'remarks',
                 ]}
@@ -311,6 +481,8 @@ def extract_from_autocad(file_path):
     return [{
         'document_no': '',
         'document_title': '',
+        'document_type': '',
+        'document_subtype': '',
         'revision': '',
         'discipline': '',
         'instrument_tag_no': '',
@@ -359,6 +531,27 @@ def dispatch_extraction(job_id, file_path, file_format):
         job.save(update_fields=['progress', 'status_message'])
 
         items = extractor_fn(file_path)
+
+        # Taxonomy classification pass — populates document_type and
+        # document_subtype on every record using the controlled taxonomy
+        # from document_taxonomy.json. Soft-coded knobs live in
+        # TAXONOMY_CONFIG above; reuses Bulk Master Index matcher so
+        # values match the manual master index file exactly.
+        try:
+            import os as _os
+            file_name = _os.path.basename(file_path)
+            body_text = _build_body_text(file_path, file_format)
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                # Skip records that already came from a structured source
+                # (Excel header row) with a non-empty subtype — respect
+                # whatever the source asserted.
+                if (it.get('document_subtype') or '').strip():
+                    continue
+                _classify_taxonomy_for_item(it, file_name=file_name, body_text=body_text)
+        except Exception:
+            logger.exception('Taxonomy classification pass failed for job %s', job_id)
 
         job.progress = 90
         job.status_message = 'Finalising results…'

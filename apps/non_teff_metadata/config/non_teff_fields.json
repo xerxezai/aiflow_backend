@@ -2,6 +2,8 @@
   "fields": [
     {"key": "document_no",          "label": "Document No.",          "width": 16},
     {"key": "document_title",       "label": "Document Title",        "width": 28},
+    {"key": "document_type",        "label": "Document Type",         "width": 18},
+    {"key": "document_subtype",     "label": "Document Sub-Type",     "width": 26},
     {"key": "revision",             "label": "Rev.",                  "width":  6},
     {"key": "discipline",           "label": "Discipline",            "width": 14},
     {"key": "instrument_tag_no",    "label": "Instrument Tag No.",    "width": 18},

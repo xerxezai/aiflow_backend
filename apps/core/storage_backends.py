@@ -238,6 +238,39 @@ if USE_S3:
             super().__init__(*args, **kwargs)
             logger.info(f"[ExportStorage] Initialized: {self.bucket_name}/{self.location}")
 
+
+    class IOListDocumentStorage(S3Boto3Storage):
+        """
+        Dedicated S3 storage for Instrument IO List PDFs.
+
+        Generates presigned S3 URLs so private files are accessible to authenticated
+        users without exposing raw S3 URLs.
+
+        Uses a region-specific endpoint_url (required for opt-in regions such as
+        me-central-1 / UAE Abu Dhabi) so that Signature=host in the presigned URL
+        matches the request host and S3 does not invalidate it with a redirect.
+
+        Expiry is soft-coded via settings.IO_LIST_PDF_PRESIGN_EXPIRY (default 3600 s).
+        """
+
+        location = 'media'
+        default_acl = 'private'
+        file_overwrite = False
+        custom_domain = False  # NEVER use custom domain — forces presigned query-string auth
+
+        @property
+        def endpoint_url(self):
+            region = getattr(settings, 'AWS_S3_REGION_NAME', 'us-east-1')
+            return getattr(settings, 'AWS_S3_ENDPOINT_URL', f'https://s3.{region}.amazonaws.com')
+
+        @property
+        def querystring_expire(self):
+            return getattr(settings, 'IO_LIST_PDF_PRESIGN_EXPIRY', 3600)
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            logger.info(f"[IOListDocumentStorage] Initialized: {self.bucket_name}/{self.location}")
+
 else:
     # Fallback to local file storage when S3 is not enabled
     from django.core.files.storage import FileSystemStorage
@@ -290,5 +323,11 @@ else:
         """Local storage for exports"""
         def __init__(self, *args, **kwargs):
             kwargs['location'] = 'media/exports'
+            super().__init__(*args, **kwargs)
+
+    class IOListDocumentStorage(FileSystemStorage):
+        """Local storage for Instrument IO List PDFs (non-S3 fallback)"""
+        def __init__(self, *args, **kwargs):
+            kwargs['location'] = 'media'
             super().__init__(*args, **kwargs)
 

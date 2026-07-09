@@ -18,10 +18,15 @@ worker_connections = 1000
 max_requests = 500          # Recycle workers after 500 requests to prevent memory leaks
 max_requests_jitter = 50    # Spread recycling to avoid simultaneous restarts
 
-# Timeout settings - CRITICAL for P&ID processing
-timeout = 1200  # 20 minutes for P&ID OCR + AI processing
-graceful_timeout = 120  # 2 minutes for graceful shutdown
-keepalive = 75  # Keep connections alive for 75 seconds (fixes ECONNRESET)
+# Timeout settings - CRITICAL for P&ID processing AND large-file uploads.
+# Soft-coded via env vars so ops can retune on Railway without a code deploy.
+#   GUNICORN_TIMEOUT          → worker request timeout in seconds (default 1800 = 30 min)
+#   GUNICORN_GRACEFUL_TIMEOUT → graceful shutdown window in seconds (default 120)
+#   GUNICORN_KEEPALIVE        → keep-alive seconds (default 75; fixes ECONNRESET)
+import os
+timeout          = int(os.environ.get("GUNICORN_TIMEOUT", "1800"))          # 30 min — supports ~1 GB uploads + AI work
+graceful_timeout = int(os.environ.get("GUNICORN_GRACEFUL_TIMEOUT", "120"))   # 2 min
+keepalive        = int(os.environ.get("GUNICORN_KEEPALIVE", "75"))           # 75 s
 
 # Logging
 accesslog = "-"

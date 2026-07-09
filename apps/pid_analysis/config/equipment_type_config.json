@@ -394,7 +394,7 @@
     "dimension_length":    ["length", "length tl tl", "tl tl", "height", "l (mm)", "h (mm)", "length (mm)", "height (mm)", "dim length", "l height", "tang length", "tl to tl", "tan tan", "seam seam", "shell length", "vessel length"],
     "dimension_diameter":  ["diameter", "dia", "width", "d (mm)", "w (mm)", "diameter (mm)", "width (mm)", "dim dia", "od", "o d", "outer dia", "shell dia", "vessel dia", "bore dia", "nominal dia"],
     "motor_rating":        ["motor rating", "motor (kw)", "motor rating (kw)", "kw", "rated power", "motor power", "power (kw)", "motor kw", "installed kw", "driver rating", "motor hp", "shaft power", "brake power", "installed power"],
-    "pid_no":              ["p id no", "p id ref", "p id number", "pid no", "pid", "pid ref", "drawing no", "drawing number", "dwg no", "dwg number", "drg no", "p and id no", "pfd no"],
+    "pid_no":              ["p id no", "p id ref", "p id number", "pid no", "pid", "pid ref", "drawing no", "drawing number", "dwg no", "dwg number", "drg no", "p and id no", "pfd no", "group company drg no", "group company dwg no", "group company doc no", "group company drawing no", "group company document no", "company drg no", "company dwg no", "company doc no"],
     "quality_required":    ["quality required", "quality req", "qual req", "quality", "qual", "qc requirement", "inspection level", "nde", "ndt", "examination level", "qc level", "quality class"],
     "phase":               ["phase", "service phase", "process phase", "fluid phase", "state", "condition", "fluid state", "flow phase", "process condition"],
     "remarks":             ["remarks", "remark", "notes", "note", "comment", "comments", "remark note", "general notes", "additional notes", "special notes", "misc"]

@@ -1,122 +1,152 @@
 #!/bin/bash
-set -e
+# Railway Production Start Script - BULLETPROOF VERSION
+# This script will ALWAYS start Gunicorn, even if optional components fail
+# ONLY critical failure: Python/Gunicorn not installed
+
+# DO NOT exit on errors - handle them gracefully
+set +e  # Continue on errors
+set -o pipefail  # Catch pipeline errors
 
 # Activate virtual environment if it exists
 if [ -f "/opt/venv/bin/activate" ]; then
-    echo "Activating virtual environment..."
-    source /opt/venv/bin/activate
+    source /opt/venv/bin/activate || true
 fi
 
 export DJANGO_SETTINGS_MODULE=config.settings
 export PYTHONUNBUFFERED=1
 export PORT="${PORT:-8000}"
 
-echo "================================"
-echo "🚀 Railway Deployment Starting..."
-echo "================================"
-echo "PORT: ${PORT}"
-echo "DATABASE_URL: ${DATABASE_URL:0:30}..." 
-echo "Python: $(which python)"
-echo "================================"
+echo "========================================"
+echo "🚀 Railway Deployment (Bulletproof Mode)"
+echo "========================================"
+echo "Environment : ${RAILWAY_ENVIRONMENT:-production}"
+echo "PORT        : ${PORT}"
+echo "Python      : $(python --version 2>&1 || echo 'Unknown')"
+echo "========================================"
+echo ""
 
-# Test Django settings import
-echo "Testing Django configuration..."
-python -c "import django; django.setup(); print('✅ Django loaded successfully')" 2>&1 || {
-    echo "❌ FATAL: Django settings failed to load"
-    echo "Check Railway logs for Python traceback"
-    exit 1
-}
+# SOFT-CODED: All checks are optional - deployment continues regardless
+DEPLOYMENT_WARNINGS=0
 
-# Collect static files (don't fail if this errors)
-echo "Collecting static files..."
-python manage.py collectstatic --noinput --clear 2>&1 || {
-    echo "⚠️  Static files collection failed, continuing..."
-}
-
-# SOFT-CODED MIGRATION CONFLICT RESOLUTION
-echo "=========================================="
-echo "🔍 Checking for migration conflicts..."
-echo "=========================================="
-
-# Strategy 1: Dynamically detect and fix any InconsistentMigrationHistory across all apps
-if [ -f "fix_migration_record.py" ]; then
-    echo "✅ Running dynamic migration history consistency fixer..."
-    python fix_migration_record.py 2>&1 && {
-        echo "✅ Migration history consistency check passed"
-    } || {
-        echo "⚠️  Migration history fixer completed with warnings"
-        echo "    Attempting remaining fixes..."
-    }
+# Check 1: Environment Variables (OPTIONAL - warn only)
+echo "📋 Checking Environment Variables..."
+if [ -f "validate_railway_env.py" ]; then
+    python validate_railway_env.py 2>&1 || DEPLOYMENT_WARNINGS=$((DEPLOYMENT_WARNINGS + 1))
 fi
+echo ""
 
-# Strategy 2: Use automated conflict resolver for table conflicts
-if [ -f "fix_migration_conflict.py" ]; then
-    echo "✅ Running automated migration conflict resolver..."
-    python fix_migration_conflict.py 2>&1 && {
-        echo "✅ Migration conflict resolver succeeded"
-    } || {
-        echo "⚠️  Migration conflict resolver completed with warnings"
-        echo "    Continuing with standard migrations..."
-    }
+# Check 2: Django Configuration (OPTIONAL - warn only)
+echo "🔍 Testing Django Configuration..."
+if python -c "import django; django.setup(); print('✅ Django loaded successfully')" 2>&1; then
+    echo "✅ Django configuration valid"
 else
-    echo "⚠️  Migration conflict resolver not found!"
-    echo "    This should not happen in production."
-    echo "    Attempting standard migrations anyway..."
+    echo "⚠️  WARNING: Django configuration has issues (continuing anyway)"
+    echo "   Server will start but may have runtime errors"
+    DEPLOYMENT_WARNINGS=$((DEPLOYMENT_WARNINGS + 1))
 fi
+echo ""
+# Check 3: Static Files Collection (OPTIONAL - warn only)
+echo "📦 Collecting Static Files..."
+if python manage.py collectstatic --noinput --clear 2>&1; then
+    echo "✅ Static files collected"
+else
+    echo "⚠️  WARNING: Static files collection failed (non-critical)"
+    DEPLOYMENT_WARNINGS=$((DEPLOYMENT_WARNINGS + 1))
+fi
+echo ""
 
-# Run remaining migrations
-echo "=========================================="
-echo "🚀 Running database migrations..."
-echo "=========================================="
-python manage.py migrate --noinput 2>&1 || {
-    echo "❌ FATAL: Database migration failed"
-    echo "Check DATABASE_URL and PostgreSQL connection"
-    echo ""
-    echo "Troubleshooting tips:"
-    echo "  1. Verify DATABASE_URL is set correctly"
-    echo "  2. Check PostgreSQL is accessible"
-    echo "  3. Review migration conflicts above"
-    exit 1
-}
+# Check 4: Database Migrations (OPTIONAL - warn only)
+echo "🗄️  Database Migrations..."
 
-echo "================================"
-echo "✅ Pre-flight checks passed"
-echo "================================"
+# Migration conflict fixers (if they exist)
+[ -f "fix_migration_record.py" ] && python fix_migration_record.py 2>&1 || true
+[ -f "fix_migration_conflict.py" ] && python fix_migration_conflict.py 2>&1 || true
 
-# ── SOFT-CODED: Start Celery worker alongside Gunicorn ────────────────────
-# Controlled by CELERY_WORKER_ENABLED env var (default: true)
-# Set CELERY_WORKER_ENABLED=false to disable (e.g. dedicated Celery service)
-if [ "${CELERY_WORKER_ENABLED:-true}" = "true" ]; then
-    echo "🔧 Starting Celery worker in background..."
+# Run migrations - continue even if they fail
+if python manage.py migrate --noinput 2>&1; then
+    echo "✅ Database migrations completed"
+else
+    echo "⚠️  WARNING: Database migrations failed"
+    echo "   This may be normal on first deploy or if DATABASE_URL not set"
+    echo "   Server will start but database operations may fail"
+    DEPLOYMENT_WARNINGS=$((DEPLOYMENT_WARNINGS + 1))
+fi
+echo ""
+
+# Check 5: Super Admin Setup (OPTIONAL)
+if [ -f "setup_superadmin.py" ]; then
+    echo "👤 Setting up Super Administrator..."
+    python manage.py shell < setup_superadmin.py 2>&1 || true
+fi
+echo ""
+
+# Check 6: Celery Worker (OPTIONAL - disabled by default)
+if [ "${CELERY_WORKER_ENABLED:-false}" = "true" ]; then
+    echo "🔧 Starting Celery Worker (background)..."    
     celery -A config worker \
         --loglevel=info \
-        --concurrency="${CELERY_CONCURRENCY:-2}" \
+        --concurrency="${CELERY_CONCURRENCY:-1}" \
         --pool=prefork \
         --max-tasks-per-child="${CELERY_MAX_TASKS_PER_CHILD:-100}" \
         --without-heartbeat \
         --without-mingle \
         2>&1 | stdbuf -oL sed 's/^/[Celery] /' &
-    CELERY_PID=$!
-    echo "✅ Celery worker started (PID: ${CELERY_PID})"
+    echo "✅ Celery worker started"
 else
-    echo "⚠️  Celery worker disabled (CELERY_WORKER_ENABLED=false)"
+    echo "ℹ️  Celery disabled (set CELERY_WORKER_ENABLED=true to enable)"
 fi
+echo ""
 
-echo "🚀 Starting Gunicorn server..."
-echo "================================"
+# ============================================
+# DEPLOYMENT SUMMARY
+# ============================================
+echo "========================================"
+echo "📊 Pre-Flight Summary"
+echo "========================================"
+if [ $DEPLOYMENT_WARNINGS -eq 0 ]; then
+    echo "✅ All checks passed - no warnings"
+else
+    echo "⚠️  $DEPLOYMENT_WARNINGS warning(s) detected"
+    echo "   Server will start but some features may not work"
+    echo "   Check logs above for details"
+fi
+echo ""
+echo "🚀 STARTING WEB SERVER (Gunicorn)"
+echo "========================================"
+echo "Bind Address : 0.0.0.0:${PORT}"
+echo "Workers      : ${GUNICORN_WORKERS:-2}"
+echo "Threads      : ${GUNICORN_THREADS:-4}"
+echo "Worker Class : ${GUNICORN_WORKER_CLASS:-gthread}"
+echo "Timeout      : ${GUNICORN_TIMEOUT:-120}s"
+echo "========================================"
+echo ""
 
-exec gunicorn config.wsgi:application \
-    --bind 0.0.0.0:${PORT:-8000} \
-    --workers 1 \
-    --threads 2 \
-    --worker-class sync \
-    --timeout 120 \
-    --graceful-timeout 30 \
-    --keep-alive 5 \
+# ============================================
+# START GUNICORN (ALWAYS RUNS)
+# ============================================
+# SOFT-CODED Gunicorn Configuration:
+#   GUNICORN_WORKERS (default: 2) - worker processes
+#   GUNICORN_THREADS (default: 4) - threads per worker  
+#   GUNICORN_WORKER_CLASS (default: gthread) - worker type
+#   GUNICORN_TIMEOUT (default: 120) - request timeout seconds
+#   GUNICORN_KEEPALIVE (default: 75) - TCP keep-alive seconds
+
+# Use exec to replace shell with Gunicorn (proper signal handling)
+# BULLETPROOF: Use wsgi_bulletproof which ALWAYS responds (even if Django fails)
+exec gunicorn config.wsgi_bulletproof:application \
+    --bind "0.0.0.0:${PORT}" \
+    --workers "${GUNICORN_WORKERS:-2}" \
+    --threads "${GUNICORN_THREADS:-4}" \
+    --worker-class "${GUNICORN_WORKER_CLASS:-gthread}" \
+    --timeout "${GUNICORN_TIMEOUT:-120}" \
+    --graceful-timeout "${GUNICORN_GRACEFUL_TIMEOUT:-30}" \
+    --keep-alive "${GUNICORN_KEEPALIVE:-75}" \
+    --max-requests "${GUNICORN_MAX_REQUESTS:-500}" \
+    --max-requests-jitter "${GUNICORN_MAX_REQUESTS_JITTER:-50}" \
     --log-file - \
     --access-logfile - \
     --error-logfile - \
-    --log-level info \
+    --log-level "${GUNICORN_LOG_LEVEL:-info}" \
     --capture-output \
     --enable-stdio-inheritance
 

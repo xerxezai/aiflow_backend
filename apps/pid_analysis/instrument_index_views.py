@@ -87,6 +87,15 @@ def extract_instrument_index(request):
         "revision":       request.data.get("revision")       or "0",
         "project_name":   request.data.get("project_name")   or "",
         "pid_no":         request.data.get("drawing_number") or filename_stem,
+        # Soft-coded category context — drives template-aware prompt + defaults.
+        # Falls back to 'default' when not supplied (back-compat with old clients).
+        "project_category": (request.data.get("project_category") or "default").strip().lower(),
+        "project_code":     request.data.get("project_code")  or "",
+        "project_client":   request.data.get("project_client") or "",
+        # Explicit unit/area code — used by tag-format normaliser as the
+        # authoritative source for the {unit} prefix (e.g. ADNOC Gas '562').
+        # Falls back to derivation from pid_no / project_code when blank.
+        "project_unit":     (request.data.get("project_unit") or "").strip(),
     }
 
     logger.info(

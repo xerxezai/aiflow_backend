@@ -4,6 +4,64 @@ from django.conf import settings
 
 
 # ---------------------------------------------------------------------------
+# PROJECT MODEL (additive, RBAC-aligned)
+# ---------------------------------------------------------------------------
+# A NonTeffProject groups multiple extraction sessions (single-file jobs +
+# bulk batches) under one logical engineering project. RBAC is enforced at
+# the view layer using the existing services.history_archive.resolve_user_role
+# helper (admins see all projects, regular users see ones they created).
+#
+# Status lifecycle (soft-coded — adjust without code changes):
+#   active → on_hold → completed → archived
+# ---------------------------------------------------------------------------
+
+
+class NonTeffProject(models.Model):
+    STATUS_ACTIVE    = 'active'
+    STATUS_ON_HOLD   = 'on_hold'
+    STATUS_COMPLETED = 'completed'
+    STATUS_ARCHIVED  = 'archived'
+
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE,    'Active'),
+        (STATUS_ON_HOLD,   'On hold'),
+        (STATUS_COMPLETED, 'Completed'),
+        (STATUS_ARCHIVED,  'Archived'),
+    ]
+
+    project_id   = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name         = models.CharField(max_length=255)
+    code         = models.CharField(max_length=64, blank=True, db_index=True)
+    client       = models.CharField(max_length=128, blank=True)
+    plant        = models.CharField(max_length=128, blank=True)
+    discipline   = models.CharField(max_length=64, blank=True)
+    description  = models.TextField(blank=True)
+    status       = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_ACTIVE, db_index=True)
+    tags         = models.JSONField(default=list, blank=True)
+    metadata     = models.JSONField(default=dict, blank=True)
+    created_at   = models.DateTimeField(auto_now_add=True)
+    updated_at   = models.DateTimeField(auto_now=True)
+    created_by   = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='non_teff_projects',
+    )
+
+    class Meta:
+        ordering = ['-updated_at', '-created_at']
+        verbose_name = 'Non-TEFF Project'
+        verbose_name_plural = 'Non-TEFF Projects'
+        indexes = [
+            models.Index(fields=['status', '-updated_at']),
+            models.Index(fields=['created_by', '-updated_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.name} [{self.status}] ({self.project_id})"
+
+
+# ---------------------------------------------------------------------------
 # BULK MASTER INDEX MODELS (additive — do not alter NonTeffExtractionJob)
 # ---------------------------------------------------------------------------
 # A NonTeffBatch groups many files uploaded in one session.
@@ -40,6 +98,12 @@ class NonTeffBatch(models.Model):
     batch_id       = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name           = models.CharField(max_length=255)
     plant          = models.CharField(max_length=64, blank=True)
+    project        = models.ForeignKey(
+        'NonTeffProject',
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='batches',
+    )
     # Batch-default column values (column.key → value) applied to every item
     batch_defaults = models.JSONField(default=dict, blank=True)
     status         = models.CharField(max_length=20, choices=BATCH_STATUS_CHOICES, default=BATCH_STATUS_DRAFT)
@@ -136,6 +200,12 @@ class NonTeffExtractionJob(models.Model):
         blank=True,
         on_delete=models.SET_NULL,
         related_name='non_teff_jobs',
+    )
+    project = models.ForeignKey(
+        NonTeffProject,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='jobs',
     )
 
     class Meta:

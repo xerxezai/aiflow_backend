@@ -59,7 +59,14 @@ class WrenchConfigWriteSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 'Service URL must use HTTPS to protect credentials in transit.'
             )
-        return value.rstrip('/') if value else value
+        if not value:
+            return value
+        # Soft-coded normalisation: admins commonly paste the AtomSVC.svc /
+        # OData metadata URL (e.g. ".../SVC/AtomSVC.svc/") instead of the JSON
+        # SVC base. Normalise here so /DocumentSearch/SearchObject resolves
+        # correctly without changing any search-core logic.
+        from .service import _normalise_svc_url  # local import to avoid cycle
+        return _normalise_svc_url(value)
 
     def create(self, validated_data):
         password_plain = validated_data.pop('password')

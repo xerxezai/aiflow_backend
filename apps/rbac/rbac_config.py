@@ -20,8 +20,15 @@ ALL_MODULES_CATALOGUE = [
     {'code': 'pfd_to_pid',             'name': 'PFD to P&ID Converter',        'icon': 'RefreshCw',   'order': 2,  'description': 'AI-powered conversion of PFD to P&ID drawings'},
     {'code': 'pfd_quality',            'name': 'PFD Quality Check',            'icon': 'CheckSquare', 'order': 3,  'description': 'AI-powered quality verification of PFD documents'},
     {'code': 'crs_documents',          'name': 'CRS Document Management',      'icon': 'FolderOpen',  'order': 4,  'description': 'Upload and manage CRS documents with AI analysis'},
-    {'code': 'designiq',               'name': 'DesignIQ',                     'icon': 'Cpu',         'order': 5,  'description': 'AI-powered design intelligence and PFD verification'},
-    {'code': 'qhse',                   'name': 'QHSE Management',              'icon': 'Shield',      'order': 6,  'description': 'Quality, Health, Safety and Environment project management'},
+    {'code': 'designiq',               'name': 'DesignIQ - AI Design Intelligence', 'icon': 'Cpu',    'order': 5,  'description': 'AI-powered engineering design optimization and analysis'},
+    {'code': 'data_mining',            'name': 'Data Mining Platform',         'icon': 'TableCells',  'order': 6,  'description': 'Tableau Prep-style data transformation and master file generation'},
+    {'code': 'qhse',                   'name': 'QHSE Overview',                'icon': 'Shield',      'order': 7,  'description': 'QHSE project quality overview dashboard'},
+    # ── QHSE Sub-Modules (each sidebar item has its own module code) ─────
+    {'code': 'qhse_detailed',          'name': 'QHSE Project Details',         'icon': 'TableCells',  'order': 71, 'description': 'Detailed project quality view and drill-down'},
+    {'code': 'qhse_quality',           'name': 'Quality Management',           'icon': 'ChartBar',    'order': 72, 'description': 'Quality metrics, audits and non-conformance tracking'},
+    {'code': 'qhse_health_safety',     'name': 'Health & Safety',              'icon': 'Shield',      'order': 73, 'description': 'Health and safety incident management'},
+    {'code': 'qhse_environmental',     'name': 'Environmental',                'icon': 'DocumentText','order': 74, 'description': 'Environmental compliance and impact management'},
+    {'code': 'qhse_energy',            'name': 'Energy Management',            'icon': 'ChartBar',    'order': 75, 'description': 'Energy consumption tracking and efficiency reporting'},
     # ── Discipline Datasheets ─────────────────────────────────────────────
     {'code': 'process_datasheet',      'name': 'Process Datasheet',            'icon': 'FileText',    'order': 10, 'description': 'Process equipment datasheets — MOV, SDV, pumps, pressure instruments'},
     {'code': 'electrical_datasheet',   'name': 'Electrical Datasheet',         'icon': 'Zap',         'order': 11, 'description': 'Electrical equipment and SLD-based datasheet generation'},
@@ -35,6 +42,13 @@ ALL_MODULES_CATALOGUE = [
     {'code': 'digitization_datasheet', 'name': 'Digitization Datasheet',       'icon': 'Scan',        'order': 19, 'description': 'AI-powered digitization of legacy datasheets'},
     {'code': 'spec_customization',     'name': 'Spec Customization',           'icon': 'Settings',    'order': 20, 'description': 'Engineering specification customization tools'},
     {'code': 'non_teff_metadata',      'name': 'Non-TEFF Metadata Extractor',  'icon': 'Search',      'order': 21, 'description': 'Extract metadata from Non-TEFF documents (PDF, Excel, Word, AutoCAD)'},
+    # ── Process sub-module codes (granular per sidebar item) ───────────────────
+    {'code': 'pid_line_list',          'name': 'Line List',                    'icon': 'TableCells',  'order': 22, 'description': 'Extract base line list columns from P&ID drawings'},
+    {'code': 'pid_equipment_list',     'name': 'Equipment List',               'icon': 'TableCells',  'order': 23, 'description': 'Extract equipment tags and type classification from P&ID'},
+    # ── Piping sub-module code (moved away from shared designiq code) ───────────
+    {'code': 'piping_critical_line_list', 'name': 'Critical Line List',        'icon': 'GitBranch',   'order': 24, 'description': '5-document critical line list with full 35-column enrichment'},
+    # ── Instrument sub-module code (split from shared instrument_datasheet code) ──
+    {'code': 'instrument_io_list',     'name': 'Instrument IO List',           'icon': 'CircleStack', 'order': 25, 'description': 'Generate or QC an Input/Output list from the instrument register'},
     # ── Admin / Platform ─────────────────────────────────────────────────
     {'code': 'user_mgmt',              'name': 'User Management',              'icon': 'Users',       'order': 50, 'description': 'Manage users, roles, and permissions'},
     {'code': 'org_settings',           'name': 'Organization Settings',        'icon': 'Settings',    'order': 51, 'description': 'Configure organization settings and preferences'},
@@ -42,6 +56,21 @@ ALL_MODULES_CATALOGUE = [
     {'code': 'file_storage',           'name': 'File Storage',                 'icon': 'Database',    'order': 53, 'description': 'Manage files and documents in S3'},
     {'code': 'reports',                'name': 'Reports & Analytics',          'icon': 'BarChart',    'order': 54, 'description': 'Generate reports and view analytics'},
     {'code': 'api_access',             'name': 'API Access',                   'icon': 'Code',        'order': 55, 'description': 'Access REST APIs programmatically'},
+    # ── HR & Payroll (Sensitive — Super Admin grant only) ─────────────────
+    {'code': 'hr_management',          'name': 'Human Resources',              'icon': 'Users',       'order': 70, 'description': 'HR management — employee records, leave, and workforce planning'},
+    {'code': 'payroll',                'name': 'Payroll Engine',               'icon': 'DollarSign',  'order': 71, 'description': 'Payroll processing, salary slips, and compensation management'},
+    {'code': 'timesheet',              'name': 'Timesheet & Attendance',       'icon': 'Clock',       'order': 72, 'description': 'Employee timesheet tracking and biometric attendance reports'},
+    {'code': 'hr_self_service',        'name': 'HR Self-Service',              'icon': 'User',        'order': 73, 'description': 'Personal leave requests, attendance records and payslip access'},
+    {'code': 'hr_onboarding',          'name': 'Onboarding | Offboarding',     'icon': 'UserPlus',    'order': 74, 'description': 'Employee lifecycle management — onboarding pipeline and offboarding exits'},
+    # ── Business Modules ──────────────────────────────────────────────────
+    {'code': 'finance',                'name': 'Finance',                      'icon': 'CreditCard',  'order': 80, 'description': 'Invoice tracking, billing and financial management'},
+    {'code': 'sales',                  'name': 'Sales',                        'icon': 'TrendingUp',  'order': 81, 'description': 'Internal sales pipeline and business development'},
+    {'code': 'project_control',        'name': 'Project Control',              'icon': 'Briefcase',   'order': 82, 'description': 'Project planning, tracking and schedule control'},
+    {'code': 'procurement',              'name': 'Procurement',                'icon': 'ShoppingCart','order': 83, 'description': 'Procurement overview and dashboard'},
+    {'code': 'procurement_vendors',      'name': 'Vendor Management',          'icon': 'Users',       'order': 84, 'description': 'Manage vendors and supplier records'},
+    {'code': 'procurement_requisitions', 'name': 'Purchase Requisitions',      'icon': 'DocumentText','order': 85, 'description': 'Purchase recommendations and requisitions'},
+    {'code': 'procurement_orders',       'name': 'Purchase Orders',            'icon': 'DocumentPlus','order': 86, 'description': 'Create and manage purchase orders'},
+    {'code': 'procurement_receipts',     'name': 'Goods Receipt',              'icon': 'Folder',      'order': 87, 'description': 'Goods receipt and delivery confirmation'},
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,12 +179,39 @@ SYSTEM_ROLES_CONFIG = [
         'is_system_role': True,
         'badge_color': 'slate',
     },
+    {
+        # SOFT-CODED: Default role — auto-assigned to every new user and to any
+        # existing user who has no other active role.  Module list is defined
+        # in ROLE_MODULE_POLICY['default'] below.  Change the module list there
+        # (not here) to update what Default users can access.
+        'code': 'default',
+        'name': 'Default',
+        'level': 4,
+        'description': 'Default access for all users — standard engineering modules plus HR self-service.',
+        'is_system_role': True,
+        'badge_color': 'green',
+    },
+    {
+        'code': 'hr_admin',
+        'name': 'HR & Payroll Administrator',
+        'level': 2,
+        'description': 'Full access to HR, Payroll, and Timesheet data. Sensitive role — grant only via Super Administrator.',
+        'is_system_role': True,
+        'badge_color': 'rose',
+        'sensitive': True,
+        'sensitive_modules': ['hr_management', 'payroll', 'timesheet', 'hr_onboarding'],
+    },
 ]
 
 # Module Assignment Strategy
+# SECURITY: We enforce strictly role-based access. Module assignment happens
+# through Roles only; direct per-user module assignment is disabled by
+# default. Flip `create_custom_roles` to True (and the matching frontend flag
+# ALLOW_PER_USER_MODULE_ASSIGNMENT in rbacAccess.config.js) to re-enable the
+# legacy per-user "custom_<email>" role hack.
 MODULE_ASSIGNMENT_CONFIG = {
     'strategy': 'role_based',  # 'role_based' or 'direct'
-    'create_custom_roles': True,  # Create custom roles for module-based assignments
+    'create_custom_roles': False,  # Legacy behaviour; disabled for role-only access.
     'custom_role_prefix': 'custom_',
     'custom_role_level': 10,  # Level for custom roles
     'clear_existing_on_update': True,  # Clear existing module assignments when updating
@@ -164,16 +220,23 @@ MODULE_ASSIGNMENT_CONFIG = {
 }
 
 # Default Role Settings
+# SOFT-CODED: change 'code' here to swap which role is auto-assigned to new users.
 DEFAULT_ROLE_CONFIG = {
-    'code': 'user',
-    'name': 'Regular User',
-    'level': 100,
+    'code': 'default',          # was 'user' — now points to the Default system role
+    'name': 'Default',
+    'level': 4,
     'auto_assign_on_creation': True,
 }
 
 # Admin Role Detection
 ADMIN_ROLE_CODES = ['super_admin', 'admin', 'administrator']
 SUPERADMIN_ROLE_CODES = ['super_admin', 'superadmin']
+
+# Sensitive roles — only Super Admin may grant these
+SENSITIVE_ROLE_CODES = ['hr_admin']
+
+# Sensitive module codes — restricted to hr_admin and super_admin
+SENSITIVE_MODULE_CODES = ['hr_management', 'payroll', 'timesheet', 'hr_onboarding']
 
 # Module Access Rules
 MODULE_ACCESS_RULES = {
@@ -258,24 +321,68 @@ SUCCESS_MESSAGES = {
 # All module codes here correspond to the 1. Engineering section in the frontend.
 # Edit this list (not views/commands) when adding/removing engineering modules.
 # ─────────────────────────────────────────────────────────────────────────────
+# SOFT-CODED: Modules granted to the Default role.
+# Edit this list to change what every ordinary user can access out of the box.
+# Does NOT include QHSE, Finance, Procurement, Sales, Project Control, or
+# HR sub-modules other than hr_self_service.
+DEFAULT_ROLE_MODULES = [
+    # ── Process Engineering ───────────────────────────────────────────
+    'pid_analysis',
+    'pfd_quality',
+    'process_datasheet',
+    'pid_line_list',
+    'pid_equipment_list',
+    # ── Piping Engineering ────────────────────────────────────────────
+    'piping_critical_line_list',
+    'piping_pms',
+    'piping_datasheet',
+    # ── Electrical Engineering ────────────────────────────────────────
+    'electrical_sld',
+    'electrical_datasheet',
+    # ── Civil Engineering ─────────────────────────────────────────────
+    'civil_datasheet',
+    # ── Mechanical Engineering ────────────────────────────────────────
+    'mechanical_datasheet',
+    # ── Digital Transformation ────────────────────────────────────────
+    'spec_customization',
+    'non_teff_metadata',
+    # ── Common & Integration ──────────────────────────────────────────
+    'crs_documents',
+    'pfd_to_pid',
+    'designiq',
+    'data_mining',
+    # ── HR Self-Service ONLY ──────────────────────────────────────────
+    'hr_self_service',
+]
+
 ENGINEERING_SECTION_MODULES = [
     # ── Core P&ID / Process ───────────────────────────────────────────
     'pid_analysis',
     'pfd_to_pid',
     'pfd_quality',
+    'pid_line_list',
+    'pid_equipment_list',
     'crs_documents',
     'designiq',
+    'data_mining',
     'qhse',
+    'qhse_detailed',
+    'qhse_quality',
+    'qhse_health_safety',
+    'qhse_environmental',
+    'qhse_energy',
     # ── Discipline Datasheets ─────────────────────────────────────────
     'process_datasheet',
     'electrical_datasheet',
     'electrical_sld',
     'instrument_datasheet',
     'instrument_index',
+    'instrument_io_list',
     'mechanical_datasheet',
     'civil_datasheet',
     'piping_datasheet',
     'piping_pms',
+    'piping_critical_line_list',
     # ── Digitization ─────────────────────────────────────────────────
     'digitization_datasheet',
     'spec_customization',
@@ -328,14 +435,25 @@ ROLE_MODULE_POLICY = {
     # Viewer: full Engineering section (read-only enforced by UI/view guards)
     'viewer': ENGINEERING_SECTION_MODULES,
 
-    # Admin: full Engineering section + all admin/platform modules
+    # Admin: full Engineering section + all admin/platform + business modules
     'admin': ENGINEERING_SECTION_MODULES + [
         'user_mgmt',
         'org_settings',
         'audit_logs',
         'reports',
         'api_access',
+        'finance',
+        'sales',
+        'project_control',
+        'procurement',
+        'procurement_vendors',
+        'procurement_requisitions',
+        'procurement_orders',
+        'procurement_receipts',
     ],
+
+    # Default: standard engineering + common + hr_self_service (see DEFAULT_ROLE_MODULES)
+    'default': DEFAULT_ROLE_MODULES,
 
     # Super-admins bypass module checks in the app, but listed for completeness
     'super_admin': [],

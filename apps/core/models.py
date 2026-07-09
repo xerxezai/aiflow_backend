@@ -49,6 +49,56 @@ class BaseModel(TimeStampedModel, SoftDeleteModel):
         abstract = True
 
 
+class Enquiry(TimeStampedModel):
+    """
+    Customer enquiry submitted from the public /enquiry form.
+    Persisted so admins can review, triage and reply from the
+    9.6 Enquiry admin page (in addition to the email notification).
+    """
+
+    URGENCY_CHOICES = [
+        ('low',    'Low Priority'),
+        ('normal', 'Normal Priority'),
+        ('high',   'High Priority'),
+        ('urgent', 'Urgent'),
+    ]
+
+    STATUS_CHOICES = [
+        ('new',        'New'),
+        ('in_review',  'In Review'),
+        ('contacted',  'Contacted'),
+        ('resolved',   'Resolved'),
+        ('spam',       'Spam'),
+    ]
+
+    name        = models.CharField(max_length=120)
+    email       = models.EmailField()
+    phone       = models.CharField(max_length=40)
+    company     = models.CharField(max_length=160, blank=True, default='')
+    subject     = models.CharField(max_length=200)
+    message     = models.TextField()
+    service     = models.CharField(max_length=60, blank=True, default='')
+    urgency     = models.CharField(max_length=10, choices=URGENCY_CHOICES, default='normal')
+
+    status      = models.CharField(max_length=12, choices=STATUS_CHOICES, default='new', db_index=True)
+    admin_notes = models.TextField(blank=True, default='')
+
+    source_ip   = models.GenericIPAddressField(null=True, blank=True)
+    user_agent  = models.CharField(max_length=400, blank=True, default='')
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['-created_at']),
+            models.Index(fields=['status', '-created_at']),
+        ]
+        verbose_name = 'Enquiry'
+        verbose_name_plural = 'Enquiries'
+
+    def __str__(self):
+        return f'{self.name} <{self.email}> — {self.subject[:60]}'
+
+
 # Smart Project Collection Models for Multi-Disciplinary Document Organization
 
 from django.contrib.auth.models import User

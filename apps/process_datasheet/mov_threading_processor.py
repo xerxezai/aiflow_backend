@@ -79,22 +79,49 @@ def process_mov_in_thread(pid_file_path, hmb_file_path, pid_filename, user_email
         except Exception as _s3_err:
             logger.warning(f'[MOV Thread {job_id}] S3 upload step failed (non-fatal): {_s3_err}')
 
-        # STEP 1: Extract P&ID data with REAL extraction (Gemini Vision AI + OCR)
-        log_and_print(f"📄 [MOV {job_id[:8]}] STEP 1: Extracting P&ID with Gemini Vision AI...")
+        # STEP 1: Extract P&ID data via soft-coded extractor chain
+        # ─────────────────────────────────────────────────────────────────────
+        # The chain tries multiple real extractors in order (Gemini Vision →
+        # OCR+OpenAI hybrid → deterministic PyMuPDF text-regex). The first
+        # strategy that returns >= MOV_EXTRACTOR_MIN_VALVES real valves wins.
+        # Order / enablement is controlled by env var MOV_EXTRACTOR_CHAIN.
+        # See: apps/process_datasheet/mov_extractor_chain.py
+        # ─────────────────────────────────────────────────────────────────────
+        log_and_print(f"📄 [MOV {job_id[:8]}] STEP 1: Extracting P&ID via extractor chain...")
         try:
-            from apps.process_datasheet.gemini_pid_extractor import GeminiPIDExtractor
-            real_extractor = GeminiPIDExtractor()
-            pid_data = real_extractor.extract_valves_from_pdf(pid_file_path, original_filename=pid_filename, valve_type='MOV')
-            
-            # Check if real extraction produced results
-            if not pid_data.get('valves') or len(pid_data.get('valves', [])) == 0:
-                raise ValueError("Real extraction returned 0 valves")
+            from apps.process_datasheet.mov_extractor_chain import extract_pid_with_chain
 
-            log_and_print(f"[MOV {job_id[:8]}] REAL extraction: {len(pid_data.get('valves', []))} MOV valves")
+            def _on_attempt(strategy_name, message):
+                # Surface progress to the polling UI via existing cache keys.
+                cache.set(
+                    f'mov_task_{job_id}_stage',
+                    f'P&ID extraction — {message}',
+                    timeout=3600,
+                )
+                log_and_print(f"[MOV {job_id[:8]}] {message}")
+
+            pid_data = extract_pid_with_chain(
+                pid_file_path=pid_file_path,
+                pid_filename=pid_filename,
+                valve_type='MOV',
+                on_attempt=_on_attempt,
+            )
+
+            method = pid_data.get('extraction_method', 'unknown')
+            n_valves = len(pid_data.get('valves', []))
+            if n_valves == 0:
+                raise ValueError('Extractor chain returned 0 valves')
+            log_and_print(
+                f"[MOV {job_id[:8]}] ✅ Chain extraction via '{method}': {n_valves} MOV valve(s)"
+            )
         except Exception as e:
-            logger.warning(f"[MOV Thread {job_id}] Real extraction failed: {e}")
-            log_and_print(f"[MOV {job_id[:8]}] Gemini P&ID extraction failed. Cause: {e}")
-            log_and_print(f"[MOV {job_id[:8]}] Check: 1) GEMINI_API_KEY set 2) PDF has visible tag circles 3) Tags start with MOV/SDV/XV etc.")
+            logger.warning(f"[MOV Thread {job_id}] Extractor chain failed: {e}")
+            log_and_print(f"[MOV {job_id[:8]}] Extractor chain failed. Cause: {e}")
+            log_and_print(
+                f"[MOV {job_id[:8]}] Falling back to MockPIDExtractor (DEMO data). "
+                "Check: 1) GEMINI_API_KEY / OPENAI_API_KEY 2) PDF has visible tag circles "
+                "3) Tags start with MOV/SDV/XV etc."
+            )
             pid_extractor = MockPIDExtractor()
             pid_data = pid_extractor.extract_from_pdf(pid_file_path, original_filename=pid_filename)
 
@@ -134,12 +161,20 @@ def process_mov_in_thread(pid_file_path, hmb_file_path, pid_filename, user_email
             # Store a helpful user-facing error — do NOT raise so the except handler
             # can produce a clean 'failed' result rather than a raw traceback message.
             user_msg = (
-                "No valve tags could be extracted from your P&ID. "
+                "No valve tags could be extracted from your P&ID after trying every "
+                "available extractor (Gemini Vision, OpenAI Vision + multi-engine OCR, "
+                "and a deterministic text-layer regex pass).\n\n"
                 "Possible causes:\n"
-                "1. The PDF page is a scanned image — ensure it has selectable text or clear circles with tag numbers.\n"
-                "2. Valve tags do not start with a known prefix (MOV, SDV, XV, FV, PG, XI, PT, etc.).\n"
-                "3. The OpenAI Vision API key may be missing or over quota.\n"
-                "Please check these and re-upload."
+                "1. The PDF is a fully-rasterised scan with no selectable text AND the "
+                "tag circles are too blurry / low-resolution for OCR to read.\n"
+                "2. Valve tags do not start with a known prefix (MOV, SDV, XV, FV, PG, "
+                "XI, PT, etc.). Add new prefixes to tag_validator.VALID_TAG_PREFIXES.\n"
+                "3. Both GEMINI_API_KEY and OPENAI_API_KEY are missing or over quota — "
+                "the chain falls through to the offline regex pass which only works on "
+                "PDFs with a text layer.\n"
+                "4. The valves visible on the drawing are not of MOV type.\n\n"
+                "Tip: try uploading a higher-resolution PDF, or export your CAD drawing "
+                "with the text layer preserved (not 'flattened to image')."
             )
             log_and_print(f"[MOV {job_id[:8]}] FAILED: {user_msg}")
             error_result = {'success': False, 'error': user_msg}

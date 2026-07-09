@@ -8,6 +8,17 @@ from django.contrib.auth import get_user_model
 from apps.core.models import TimeStampedModel
 import uuid
 
+# Import master database tables for project-based procurement
+from .models_master import (
+    Project, Budget, CostCenter,
+    ProjectStatus, ProjectType, BudgetCategory
+)
+
+__all__ = [
+    'Vendor', 'PurchaseRequisition', 'PurchaseOrder', 'Receipt', 'PODocument',
+    'Project', 'Budget', 'CostCenter',  # Master tables
+]
+
 User = get_user_model()
 
 
@@ -217,6 +228,7 @@ class PurchaseRequisition(TimeStampedModel):
 class PurchaseOrder(TimeStampedModel):
     """
     Purchase Order (PO) - Official order to vendor
+    Enhanced with comprehensive Oil & Gas procurement fields
     """
     
     STATUS_CHOICES = [
@@ -233,6 +245,9 @@ class PurchaseOrder(TimeStampedModel):
     po_number = models.CharField(max_length=50, unique=True, db_index=True)
     pr_reference = models.ForeignKey(PurchaseRequisition, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_orders')
     
+    # PR/Requisition Details (soft-coded extraction fields)
+    pr_requester_name = models.CharField(max_length=200, blank=True, help_text='Name of person who requested the PR')
+    
     # Vendor info
     vendor = models.ForeignKey(Vendor, on_delete=models.PROTECT, related_name='purchase_orders')
     
@@ -242,18 +257,52 @@ class PurchaseOrder(TimeStampedModel):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
     category = models.CharField(max_length=50)
     
-    # Financial
+    # Financial (soft-coded for AI extraction)
     total_amount = models.DecimalField(max_digits=15, decimal_places=2)
     currency = models.CharField(max_length=10, default='USD')
     tax_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     discount_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     
+    # Payment Terms (soft-coded for extraction from PO documents)
+    payment_terms = models.CharField(max_length=300, blank=True, help_text='e.g., Net 30, 50% advance / 50% completion')
+    delivery_terms = models.CharField(max_length=200, blank=True, help_text='e.g., FOB, CIF, DAP, DDP')
+    payment_milestones = models.JSONField(default=list, blank=True, help_text='Payment schedule milestones')
+    # Example: [{'milestone': 'Advance', 'percentage': 30, 'amount': 10000, 'due_date': '2026-07-01'}]
+    
+    # ═══ PROJECT LINKAGE (Master Database Integration) ═══
+    # Professional project-based procurement with master database
+    project = models.ForeignKey(
+        'Project',  # FK to master Project table
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='purchase_orders',
+        help_text='Link to master project registry'
+    )
+    project_number = models.CharField(
+        max_length=100, blank=True, db_index=True,
+        help_text='Project code (for AI extraction / legacy compatibility)'
+    )
+    project_manager = models.CharField(max_length=200, blank=True, help_text='Project Manager name (soft-coded)')
+    budget_allocation = models.ForeignKey(
+        'Budget',  # FK to project budget line
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='purchase_orders',
+        help_text='Link to specific budget line item'
+    )
+    budget = models.DecimalField(
+        max_digits=15, decimal_places=2, null=True, blank=True,
+        help_text='Allocated budget for this PO (deprecated, use budget_allocation FK)'
+    )
+    
     # Items
     items = models.JSONField(default=list, blank=True)
     # Example: [{'item': 'Laptop', 'qty': 2, 'unit_price': 1500, 'total': 3000}]
     
-    # Dates
+    # Dates (soft-coded for AI extraction)
     po_date = models.DateField(auto_now_add=True)
+    start_date = models.DateField(null=True, blank=True, help_text='Service/Project start date')
+    end_date = models.DateField(null=True, blank=True, help_text='Service/Project end date')
     expected_delivery = models.DateField(null=True, blank=True)
     actual_delivery = models.DateField(null=True, blank=True)
     
@@ -270,6 +319,31 @@ class PurchaseOrder(TimeStampedModel):
     material_grade = models.CharField(max_length=100, blank=True)  # e.g., API 5L X65, ASTM A106 Gr. B
     pressure_rating = models.CharField(max_length=50, blank=True)  # Pressure class/rating
     temperature_rating = models.CharField(max_length=50, blank=True)  # Temperature range
+    
+    # ═══ INVOICE TRACKING (A/P Integration) ═══
+    # Professional linkage to vendor invoices for payment tracking
+    # Enables PO → Invoice reconciliation and 3-way matching
+    related_invoices = models.ManyToManyField(
+        'finance.Invoice',  # Link to apps.finance.Invoice (A/P invoices)
+        blank=True,
+        related_name='purchase_orders',
+        help_text='Vendor invoices against this PO'
+    )
+    invoice_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('not_invoiced', 'Not Invoiced'),
+            ('partially_invoiced', 'Partially Invoiced'),
+            ('fully_invoiced', 'Fully Invoiced'),
+            ('over_invoiced', 'Over Invoiced'),  # Invoice amount > PO amount
+        ],
+        default='not_invoiced',
+        help_text='Invoice reconciliation status'
+    )
+    total_invoiced_amount = models.DecimalField(
+        max_digits=15, decimal_places=2, default=0,
+        help_text='Sum of all related invoice amounts'
+    )
     
     # People
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='pos_created')
@@ -292,6 +366,70 @@ class PurchaseOrder(TimeStampedModel):
     
     def __str__(self):
         return f"PO-{self.po_number}: {self.title}"
+    
+    # ═══ BUSINESS LOGIC METHODS (Soft-Coded) ═══
+    
+    def update_invoice_status(self):
+        """
+        Recalculate invoice status based on related invoices.
+        Soft-coded 3-way matching logic: PO ↔ Invoice ↔ Receipt
+        """
+        from django.db.models import Sum
+        total_invoiced = self.related_invoices.aggregate(
+            total=Sum('total_amount')
+        )['total'] or 0
+        
+        self.total_invoiced_amount = total_invoiced
+        
+        if total_invoiced == 0:
+            self.invoice_status = 'not_invoiced'
+        elif total_invoiced < self.total_amount:
+            self.invoice_status = 'partially_invoiced'
+        elif total_invoiced == self.total_amount:
+            self.invoice_status = 'fully_invoiced'
+        else:
+            self.invoice_status = 'over_invoiced'
+        
+        self.save(update_fields=['invoice_status', 'total_invoiced_amount'])
+    
+    def get_budget_variance(self):
+        """Calculate variance against allocated budget"""
+        if not self.budget_allocation:
+            return None
+        allocated = self.budget_allocation.allocated_amount
+        return self.total_amount - allocated
+    
+    def is_over_budget(self):
+        """Check if PO exceeds allocated budget"""
+        variance = self.get_budget_variance()
+        return variance > 0 if variance is not None else False
+    
+    def get_project_display(self):
+        """Get project name/number for display (smart fallback)"""
+        if self.project:
+            return f"{self.project.project_number} - {self.project.project_name}"
+        elif self.project_number:
+            return self.project_number
+        return "No Project Assigned"
+    
+    def auto_link_project(self):
+        """
+        Auto-link to Project master table by matching project_number.
+        Enables migration from string-based to FK-based project tracking.
+        """
+        if self.project or not self.project_number:
+            return False
+        
+        try:
+            project = Project.objects.get(project_number=self.project_number)
+            self.project = project
+            self.save(update_fields=['project'])
+            return True
+        except Project.DoesNotExist:
+            return False
+        except Project.MultipleObjectsReturned:
+            # Log warning - data integrity issue
+            return False
 
 
 class Receipt(TimeStampedModel):
@@ -351,3 +489,54 @@ class Receipt(TimeStampedModel):
     
     def __str__(self):
         return f"GRN-{self.receipt_number} for {self.purchase_order.po_number}"
+
+
+class PODocument(TimeStampedModel):
+    """
+    Uploaded PO/PR PDF document - stores S3 reference and AI-extracted data.
+    One record per uploaded file; linked to a PurchaseOrder once confirmed.
+    """
+
+    EXTRACTION_STATUS_CHOICES = [
+        ('pending', 'Pending Extraction'),
+        ('processing', 'Processing'),
+        ('completed', 'Extraction Completed'),
+        ('failed', 'Extraction Failed'),
+    ]
+
+    DOC_TYPE_CHOICES = [
+        ('purchase_order', 'Purchase Order'),
+        ('purchase_requisition', 'Purchase Requisition'),
+        ('unknown', 'Unknown'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Source file
+    original_filename = models.CharField(max_length=300)
+    s3_key = models.CharField(max_length=500, blank=True)
+    s3_url = models.URLField(max_length=1000, blank=True)
+    file_size_bytes = models.PositiveIntegerField(default=0)
+
+    # Detection
+    document_type = models.CharField(max_length=30, choices=DOC_TYPE_CHOICES, default='unknown')
+    extraction_status = models.CharField(max_length=20, choices=EXTRACTION_STATUS_CHOICES, default='pending')
+    extraction_error = models.TextField(blank=True)
+
+    # AI extracted payload — mirrors all PO/PR fields
+    extracted_data = models.JSONField(default=dict, blank=True)
+
+    # Audit
+    uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='po_documents_uploaded')
+    confirmed_po = models.ForeignKey(
+        PurchaseOrder, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='source_documents',
+        help_text='Populated once user confirms the extracted data as a real PO'
+    )
+
+    class Meta:
+        db_table = 'procurement_po_documents'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"PODoc:{self.original_filename} [{self.extraction_status}]"

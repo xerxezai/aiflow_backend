@@ -6,6 +6,44 @@ from django.conf import settings
 from apps.core.models import BaseModel
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Soft-coded choice lists — edit here only (no migration for label changes).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ISO 4217 currency codes commonly used in Oil & Gas projects.
+# Add / remove codes here to adjust the dropdown options system-wide.
+CURRENCY_CHOICES = [
+    ('AED', 'AED — UAE Dirham'),
+    ('USD', 'USD — US Dollar'),
+    ('EUR', 'EUR — Euro'),
+    ('GBP', 'GBP — British Pound'),
+    ('SAR', 'SAR — Saudi Riyal'),
+    ('QAR', 'QAR — Qatari Riyal'),
+    ('KWD', 'KWD — Kuwaiti Dinar'),
+    ('BHD', 'BHD — Bahraini Dinar'),
+    ('OMR', 'OMR — Omani Rial'),
+]
+
+# Engineering scope types used across Oil & Gas, EPC, and consultancy projects.
+# Values are DB-stored; labels are display-only — safe to change labels.
+SCOPE_TYPE_CHOICES = [
+    ('conceptual',           'Conceptual Study'),
+    ('pre_feed',             'Pre-FEED'),
+    ('feed',                 'FEED'),
+    ('basic_engineering',    'Basic Engineering'),
+    ('detailed_engineering', 'Detailed Engineering'),
+    ('epcm',                 'EPCM'),
+    ('epc',                  'EPC (Lump Sum)'),
+    ('pmc',                  'PMC (Project Management Consultancy)'),
+    ('owner_engineer',       'Owner\'s Engineer'),
+    ('procurement',          'Procurement Only'),
+    ('construction',         'Construction Management'),
+    ('commissioning',        'Commissioning & Start-Up'),
+    ('feasibility',          'Feasibility Study'),
+    ('other',                'Other / Mixed Scope'),
+]
+
+
 class Project(BaseModel):
     """
     Project model for managing engineering projects
@@ -55,6 +93,31 @@ class Project(BaseModel):
     budget = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     spent = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     
+    # Contract — separate from internal budget; the awarded commercial value.
+    # contract_value stores the signed contract amount (e.g. 12.5M AED).
+    # currency applies to contract_value; budget retains its own implicit currency.
+    # scope_type classifies the engineering engagement for project dashboard KPIs.
+    contract_value = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text='Awarded contract value (commercial, separate from internal budget estimate).',
+    )
+    currency = models.CharField(
+        max_length=8,
+        choices=CURRENCY_CHOICES,
+        default='AED',
+        help_text='ISO 4217 currency code for the contract value.',
+    )
+    scope_type = models.CharField(
+        max_length=30,
+        choices=SCOPE_TYPE_CHOICES,
+        blank=True,
+        default='',
+        help_text='Engineering scope / engagement type (FEED, Detailed Engineering, EPC, …).',
+    )
+
     # Metadata
     client_name = models.CharField(max_length=255, blank=True)
     location = models.CharField(max_length=255, blank=True)

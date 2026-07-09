@@ -23,7 +23,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 
-from .models import NonTeffExtractionJob
+from .models import NonTeffExtractionJob, NonTeffProject
 from .services.extractor import run_extraction_async
 from .services import history_archive
 
@@ -146,6 +146,23 @@ def upload_non_teff_file(request):
     tmp_path = tmp.name
     tmp.close()
 
+    # Resolve optional project assignment. Accepts either form-field
+    # `project_id` or `project` (soft-coded list of accepted names so the
+    # frontend can evolve without backend churn).
+    project_obj = None
+    PROJECT_FIELD_NAMES = ('project_id', 'project', 'projectId')
+    project_ref = ''
+    for name in PROJECT_FIELD_NAMES:
+        val = (request.data.get(name) or '').strip() if hasattr(request.data, 'get') else ''
+        if val:
+            project_ref = val
+            break
+    if project_ref:
+        try:
+            project_obj = NonTeffProject.objects.get(project_id=project_ref)
+        except (NonTeffProject.DoesNotExist, ValueError, Exception):
+            project_obj = None  # ignore bad references — upload still proceeds
+
     # Create DB job record
     job = NonTeffExtractionJob.objects.create(
         file_name=uploaded_file.name,
@@ -153,6 +170,7 @@ def upload_non_teff_file(request):
         status=NonTeffExtractionJob.STATUS_PENDING,
         status_message='Queued for extraction',
         created_by=request.user,
+        project=project_obj,
     )
 
     # Kick off async extraction
@@ -288,6 +306,26 @@ def list_non_teff_history(request):
         'total': len(items),
         'items': items,
     })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def non_teff_archive_diagnostics(request):
+    """
+    Lightweight read-only probe — tells the History UI whether S3 archival
+    is wired up. Soft-coded: returns whatever ``HISTORY_CONFIG`` + the live
+    boto3 connection report, no secrets leaked.
+    Response: { enabled, connected, reachable, bucket, region, root_prefix,
+                object_count, error }
+    """
+    info = history_archive.get_archive_diagnostics()
+    # Never leak full bucket name to non-admins — show short suffix only.
+    role = history_archive.resolve_user_role(request.user)
+    if role not in history_archive.HISTORY_CONFIG.get('cross_user_access_roles', set()):
+        b = info.get('bucket') or ''
+        if len(b) > 6:
+            info['bucket'] = '…' + b[-6:]
+    return Response(info)
 
 
 @api_view(['GET'])

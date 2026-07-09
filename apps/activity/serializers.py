@@ -25,7 +25,8 @@ class SystemActivitySerializer(serializers.ModelSerializer):
             'user_agent',
             'ip_address',
             'severity',
-            'status',
+            'success',  # FIXED: Changed from 'status' to 'success' (actual model field)
+            'error_message',
             'timestamp',
             'duration',
             'details',

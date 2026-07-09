@@ -163,6 +163,9 @@ class SalarySlipSerializer(serializers.ModelSerializer):
     employee_name = serializers.SerializerMethodField()
     employee_email = serializers.EmailField(source='employee_salary_info.user.email', read_only=True)
     employee_id = serializers.CharField(source='employee_salary_info.employee_id', read_only=True)
+    # employee_code is a canonical alias for employee_id so frontend can join
+    # biometric timesheet rows (keyed on employee_code) without namespace confusion
+    employee_code = serializers.CharField(source='employee_salary_info.employee_id', read_only=True)
     department = serializers.CharField(source='employee_salary_info.department', read_only=True)
     designation = serializers.CharField(source='employee_salary_info.designation', read_only=True)
     payroll_run_code = serializers.CharField(source='payroll_run.run_code', read_only=True)
@@ -174,7 +177,7 @@ class SalarySlipSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'slip_number', 'payroll_run', 'payroll_run_code',
             'employee_salary_info', 'employee_name', 'employee_email',
-            'employee_id', 'department', 'designation', 'month', 'year',
+            'employee_id', 'employee_code', 'department', 'designation', 'month', 'year',
             'basic_salary', 'total_allowances', 'gross_salary',
             'total_deductions', 'tax_deduction', 'net_salary', 'currency',
             'allowances_breakdown', 'deductions_breakdown',
@@ -200,15 +203,23 @@ class SalarySlipListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for listing salary slips"""
     employee_name = serializers.SerializerMethodField()
     employee_id = serializers.CharField(source='employee_salary_info.employee_id', read_only=True)
+    # employee_code aliases employee_id so list responses support biometric joins
+    employee_code = serializers.CharField(source='employee_salary_info.employee_id', read_only=True)
     employee_email = serializers.EmailField(source='employee_salary_info.user.email', read_only=True)
+    employee_join_date = serializers.DateField(source='employee_salary_info.join_date', read_only=True)
+    department = serializers.CharField(source='employee_salary_info.department', read_only=True)
+    designation = serializers.CharField(source='employee_salary_info.designation', read_only=True)
+    employee_designation = serializers.CharField(source='employee_salary_info.designation', read_only=True)
     month_year = serializers.SerializerMethodField()
     
     class Meta:
         model = SalarySlip
         fields = [
-            'id', 'slip_number', 'employee_name', 'employee_id', 'employee_email',
-            'month', 'year', 'month_year', 'gross_salary', 'total_deductions',
-            'net_salary', 'currency', 'status', 'created_at'
+            'id', 'slip_number', 'employee_name', 'employee_id', 'employee_code', 'employee_email',
+            'employee_join_date', 'department', 'designation', 'employee_designation',
+            'month', 'year', 'month_year', 'basic_salary', 'total_allowances', 'gross_salary', 'total_deductions',
+            'tax_deduction', 'net_salary', 'currency', 'allowances_breakdown', 'deductions_breakdown',
+            'working_days', 'present_days', 'absent_days', 'status', 'created_at', 'updated_at'
         ]
     
     def get_employee_name(self, obj):
@@ -231,6 +242,170 @@ class SalarySlipCreateSerializer(serializers.Serializer):
         default=False,
         help_text="Automatically approve slips without requiring workflow."
     )
+
+
+class SalarySlipDetailSerializer(serializers.ModelSerializer):
+    """
+    Detailed salary slip serializer with full breakdown
+    Includes all allowances, deductions, and audit info
+    """
+    employee_name = serializers.SerializerMethodField()
+    employee_id = serializers.CharField(source='employee_salary_info.employee_id', read_only=True)
+    employee_email = serializers.EmailField(source='employee_salary_info.user.email', read_only=True)
+    employee_designation = serializers.CharField(source='employee_salary_info.designation', read_only=True)
+    payroll_run_code = serializers.CharField(source='payroll_run.run_code', read_only=True)
+    approved_by_name = serializers.CharField(source='approved_by.get_full_name', read_only=True)
+    generated_by_name = serializers.CharField(source='generated_by.get_full_name', read_only=True)
+    
+    class Meta:
+        model = SalarySlip
+        fields = [
+            'id', 'slip_number', 
+            'employee_name', 'employee_id', 'employee_email', 'employee_designation',
+            'payroll_run_code', 'month', 'year',
+            'basic_salary', 'total_allowances', 'gross_salary',
+            'total_deductions', 'tax_deduction', 'net_salary',
+            'currency',
+            'allowances_breakdown', 'deductions_breakdown',
+            'working_days', 'present_days', 'absent_days',
+            'status', 'approved_by', 'approved_by_name', 'approved_at',
+            'rejection_reason', 'remarks', 'internal_notes',
+            'pdf_file_path', 'pdf_generated_at', 'pdf_s3_key',
+            'generated_by', 'generated_by_name',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = [
+            'id', 'slip_number', 'employee_name', 'employee_id', 'employee_email',
+            'employee_designation', 'payroll_run_code', 'month', 'year',
+            'gross_salary', 'total_allowances', 'total_deductions', 'net_salary',
+            'approved_by_name', 'generated_by_name', 'created_at', 'updated_at'
+        ]
+    
+    def get_employee_name(self, obj):
+        return obj.employee_salary_info.user.get_full_name() or obj.employee_salary_info.user.email
+
+
+class SalarySlipUpdateSerializer(serializers.ModelSerializer):
+    """
+    Update serializer with validation and smart auto-calculation
+    Allows editing: basic_salary, allowances, deductions, working days
+    Auto-calculates: gross, net, totals
+    """
+    
+    class Meta:
+        model = SalarySlip
+        fields = [
+            'basic_salary',
+            'allowances_breakdown',
+            'deductions_breakdown',
+            'tax_deduction',
+            'working_days',
+            'present_days',
+            'absent_days',
+            'status',
+            'remarks',
+            'internal_notes'
+        ]
+    
+    def validate_basic_salary(self, value):
+        """Validate basic salary is within acceptable range"""
+        MIN_BASIC_SALARY = Decimal('0.00')
+        MAX_BASIC_SALARY = Decimal('999999.99')
+        
+        if value < MIN_BASIC_SALARY:
+            raise serializers.ValidationError(
+                f"Basic salary cannot be less than {MIN_BASIC_SALARY}"
+            )
+        if value > MAX_BASIC_SALARY:
+            raise serializers.ValidationError(
+                f"Basic salary cannot exceed {MAX_BASIC_SALARY}"
+            )
+        return value
+    
+    def validate_working_days(self, value):
+        """Validate working days"""
+        MIN_WORKING_DAYS = 1
+        MAX_WORKING_DAYS = 31
+        
+        if value < MIN_WORKING_DAYS:
+            raise serializers.ValidationError(
+                f"Working days must be at least {MIN_WORKING_DAYS}"
+            )
+        if value > MAX_WORKING_DAYS:
+            raise serializers.ValidationError(
+                f"Working days cannot exceed {MAX_WORKING_DAYS}"
+            )
+        return value
+    
+    def validate_present_days(self, value):
+        """Validate present days"""
+        if value < 0:
+            raise serializers.ValidationError("Present days cannot be negative")
+        return value
+    
+    def validate_allowances_breakdown(self, value):
+        """Validate allowances breakdown structure"""
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Allowances breakdown must be a dictionary")
+        
+        MIN_AMOUNT = Decimal('0.00')
+        MAX_AMOUNT = Decimal('999999.99')
+        
+        for key, amount in value.items():
+            try:
+                amount_decimal = Decimal(str(amount))
+                if amount_decimal < MIN_AMOUNT:
+                    raise serializers.ValidationError(
+                        f"Allowance '{key}' cannot be negative"
+                    )
+                if amount_decimal > MAX_AMOUNT:
+                    raise serializers.ValidationError(
+                        f"Allowance '{key}' exceeds maximum allowed amount"
+                    )
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(
+                    f"Allowance '{key}' must be a valid number"
+                )
+        
+        return value
+    
+    def validate_deductions_breakdown(self, value):
+        """Validate deductions breakdown structure"""
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Deductions breakdown must be a dictionary")
+        
+        MIN_AMOUNT = Decimal('0.00')
+        MAX_AMOUNT = Decimal('999999.99')
+        
+        for key, amount in value.items():
+            try:
+                amount_decimal = Decimal(str(amount))
+                if amount_decimal < MIN_AMOUNT:
+                    raise serializers.ValidationError(
+                        f"Deduction '{key}' cannot be negative"
+                    )
+                if amount_decimal > MAX_AMOUNT:
+                    raise serializers.ValidationError(
+                        f"Deduction '{key}' exceeds maximum allowed amount"
+                    )
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(
+                    f"Deduction '{key}' must be a valid number"
+                )
+        
+        return value
+    
+    def validate(self, data):
+        """Cross-field validation"""
+        working_days = data.get('working_days', getattr(self.instance, 'working_days', 30))
+        present_days = data.get('present_days', getattr(self.instance, 'present_days', 30))
+        
+        if present_days > working_days:
+            raise serializers.ValidationError({
+                'present_days': f"Present days ({present_days}) cannot exceed working days ({working_days})"
+            })
+        
+        return data
 
 
 # ===========================

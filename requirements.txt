@@ -58,6 +58,10 @@ python-docx==1.1.0
 pdfplumber>=0.10.0
 python-dateutil==2.8.2
 
+# SQL Server connector for Time Sheet Analytics (apps.timesheet)
+# pymssql ships manylinux wheels — no system ODBC driver needed.
+pymssql>=2.2.11
+
 # ==========================================
 # 6. AWS S3 STORAGE (Required)
 # ==========================================
@@ -80,6 +84,7 @@ google-auth-oauthlib>=1.1.0
 numpy>=1.24.0
 pandas>=2.1.0
 networkx==3.2.1
+psutil>=5.9.0  # Real-time CPU/memory/disk metrics for the admin dashboard
 
 # ==========================================
 # 9. OCR STACK (Required for P&ID/PFD Processing)

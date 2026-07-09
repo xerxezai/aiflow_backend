@@ -153,8 +153,10 @@ VISION_CONFIG: Dict[str, Any] = {
         'class_review':  'Class / Review Code / CRS Code / Review Class (e.g. 1, 2, 3, A, B, C, D)',
         'transmittal_no':'Transmittal No. / Document Transmittal Number / DTN / TRN / TR-####',
         'issue_date':    'Issue Date / Date / Revision Date (numeric format DD/MM/YY or DD-MM-YYYY)',
-        'revision':      'Revision (single letter A-Z, or two-digit 00-99, or letters like IFR/IFA/IFC)',
+        'revision':      'Revision: hand-printed or typed "Rev" / "rev" / "REV" — usually a single letter A-Z, two-digit 00-99, or short codes IFR / IFA / IFC / IFP. Old / handwritten drawings may show it without a colon, with extra whitespace, or with a hyphen ("Rev-0", "rev. A"). Read it from the title-block revision-history column, not from a body paragraph.',
         'document_number':'Drawing/Document Number printed in the title block (alphanumeric with hyphens)',
+        'unit':          'Unit / Plant Unit / Unit No / Unit Code / Activate-Unit / Activated Unit / Active Unit. Value is usually a 2-5 digit number ("47", "7600"), but ADNOC legacy drawings may print a compound code like "7600 L 02" or "7300L-04" — return the value exactly as printed (digits + optional letter + digits).',
+        'vendor_name':   'Vendor / Vendor Name / Manufacturer / Supplier / Made By / Supplied By / Make / MFG / M/S — the company that produced the equipment. Old or handwritten drawings often print the label "VENDOR" on one line and the company name on the NEXT line WITHOUT a colon (e.g. "VENDOR\\nNUOVO PIGNONE S.P.A."). Return the full company name including legal suffix (SPA, S.R.L., LLC, LTD, GMBH, INC, BV, NV, CO).',
     },
 
     # ─── Anti-hallucination: per-field regex validators ──────────────────
@@ -179,7 +181,10 @@ VISION_CONFIG: Dict[str, Any] = {
             ),
             'min_alnum': 4, 'max_len': 24,
         },
-        # Revision codes: A, 0, 01, IFA, IFC, IFR, P1, …
+        # Revision codes: A, 0, 01, IFA, IFC, IFR, P1, R0, IFR1, …
+        # Soft-coded — accepts 1-2 leading letters + up to 3 trailing
+        # alphanumerics with optional hyphen so handwritten "Rev-A1"
+        # / "P1" / "IFR1" pass through cleanly.
         'revision': {
             'pattern': r'(?i)^[A-Z0-9][A-Z0-9\-]{0,5}$',
             'min_alnum': 1, 'max_len': 6,
@@ -207,6 +212,10 @@ VISION_CONFIG: Dict[str, Any] = {
         'author':         {'pattern': r"^[A-Za-z][A-Za-z0-9 .,&'\-/()]{1,60}$", 'min_alnum': 2, 'max_len': 60},
         'originator':     {'pattern': r"^[A-Za-z][A-Za-z0-9 .,&'\-/()]{1,80}$", 'min_alnum': 2, 'max_len': 80},
         'vendor_name':    {'pattern': r"^[A-Za-z][A-Za-z0-9 .,&'\-/()]{1,80}$", 'min_alnum': 2, 'max_len': 80},
+        # Unit codes: 2-5 digits ("47", "7600"), comma-joined ("68,94,95"),
+        # OR ADNOC alphanumeric ("7600 L 02", "7300L-04"). Soft-coded —
+        # widen the prefix/suffix digit range to accept more legacy forms.
+        'unit':           {'pattern': r"(?i)^(?:\d{2,5}(?:\s*,\s*\d{2,5})*|\d{4}\s*[A-Z][\s\-]*\d{1,2})$", 'min_alnum': 2, 'max_len': 24},
     },
 
     # Generic noise/hallucination filter applied to EVERY vision result.

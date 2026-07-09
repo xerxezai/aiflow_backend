@@ -1,8 +1,23 @@
 from django.urls import path
 
-from . import batch_views, views
+from . import batch_views, project_views, smart_views, views
 
 urlpatterns = [
+    # Projects (additive — RBAC-aligned organisational layer)
+    path('projects/',                          project_views.projects_collection,  name='non-teff-projects'),
+    path('projects/<uuid:project_id>/',        project_views.project_detail,       name='non-teff-project-detail'),
+    path('projects/<uuid:project_id>/items/',  project_views.list_project_items,   name='non-teff-project-items'),
+
+    # Smart Features (additive — analytic post-extraction insights)
+    path('smart/confidence/',   smart_views.smart_confidence,   name='non-teff-smart-confidence'),
+    path('smart/repair/',       smart_views.smart_repair,       name='non-teff-smart-repair'),
+    path('smart/consistency/',  smart_views.smart_consistency,  name='non-teff-smart-consistency'),
+    path('smart/query/',        smart_views.smart_query,        name='non-teff-smart-query'),
+    path('smart/classify/',     smart_views.smart_classify,     name='non-teff-smart-classify'),
+    path('smart/auto-link/',    smart_views.smart_auto_link,    name='non-teff-smart-autolink'),
+    path('smart/timeline/',     smart_views.smart_timeline,     name='non-teff-smart-timeline'),
+    path('smart/bulk-suggest/', smart_views.smart_bulk_suggest, name='non-teff-smart-bulk'),
+
     # Existing single-file workflow (unchanged)
     path('upload/', views.upload_non_teff_file, name='non-teff-upload'),
     path('status/<str:job_id>/', views.get_non_teff_status, name='non-teff-status'),
@@ -13,6 +28,9 @@ urlpatterns = [
     path('batch/template/', batch_views.get_batch_template, name='non-teff-batch-template'),
     path('batch/create/',   batch_views.create_batch,       name='non-teff-batch-create'),
     path('batch/<uuid:batch_id>/upload/',                batch_views.upload_batch_files,  name='non-teff-batch-upload'),
+    # Direct-to-S3 presigned upload (large-file path, bypasses Railway edge cap)
+    path('batch/<uuid:batch_id>/upload/presign/',        batch_views.presign_batch_upload,  name='non-teff-batch-upload-presign'),
+    path('batch/<uuid:batch_id>/upload/complete/',       batch_views.complete_batch_upload, name='non-teff-batch-upload-complete'),
     path('batch/<uuid:batch_id>/start/',                 batch_views.start_batch,         name='non-teff-batch-start'),
     path('batch/<uuid:batch_id>/status/',                batch_views.batch_status,        name='non-teff-batch-status'),
     path('batch/<uuid:batch_id>/items/',                 batch_views.list_batch_items,    name='non-teff-batch-items'),
@@ -40,6 +58,7 @@ urlpatterns = [
 
     # History (additive — role-based, S3-backed, doesn't touch core logic)
     path('history/',                  views.list_non_teff_history, name='non-teff-history-list'),
+    path('history/diagnostics/',      views.non_teff_archive_diagnostics, name='non-teff-history-diag'),
     path('history/<str:job_id>/',     views.load_non_teff_history, name='non-teff-history-load'),
     path('history/<str:job_id>/delete/', views.delete_non_teff_history, name='non-teff-history-delete'),
     path('history/<str:job_id>/update/', views.update_non_teff_history, name='non-teff-history-update'),

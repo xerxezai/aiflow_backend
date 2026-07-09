@@ -124,6 +124,59 @@ def get_field_info_from_operation(operation, app_label):
         }
     return None
 
+def check_migration_order_conflicts():
+    """
+    Check for migration order conflicts and fix them.
+    Specifically handles cases where a migration is applied before its dependency.
+    """
+    print_info("Checking for migration order conflicts...")
+    
+    # Known conflict: procurement.0007 depends on finance.0007
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT id, app, name 
+            FROM django_migrations 
+            WHERE (app = 'finance' AND name = '0007_payrollworkflow_workflownotificationlog_and_more') 
+               OR (app = 'procurement' AND name = '0007_add_master_database_tables')
+            ORDER BY id;
+        """)
+        rows = cursor.fetchall()
+        
+        if len(rows) == 2:
+            finance_id = next((r[0] for r in rows if r[1] == 'finance'), None)
+            procurement_id = next((r[0] for r in rows if r[1] == 'procurement'), None)
+            
+            if finance_id and procurement_id and procurement_id < finance_id:
+                print_warning(f"Found migration order conflict:")
+                print_warning(f"  procurement.0007 (ID {procurement_id}) is before finance.0007 (ID {finance_id})")
+                print_info("Fixing migration order by re-applying in correct sequence...")
+                
+                # Delete both records
+                cursor.execute("""
+                    DELETE FROM django_migrations 
+                    WHERE (app = 'finance' AND name = '0007_payrollworkflow_workflownotificationlog_and_more')
+                       OR (app = 'procurement' AND name = '0007_add_master_database_tables');
+                """)
+                print_info("  Removed conflicting migration records")
+                
+                # Re-apply in correct order using fake
+                from django.core.management import call_command
+                print_info("  Fake-applying finance.0007 first...")
+                call_command('migrate', 'finance', '0007', fake=True, verbosity=0)
+                
+                print_info("  Fake-applying procurement.0007 second...")
+                call_command('migrate', 'procurement', '0007', fake=True, verbosity=0)
+                
+                print_success("Migration order conflict resolved!")
+                return True
+        
+        elif len(rows) == 1:
+            # One is applied, the other is not - this is fine
+            return False
+        
+        # Both not applied or no conflict
+        return False
+
 def main():
     """Main migration conflict resolver"""
     print_header("SOFT-CODED MIGRATION CONFLICT RESOLVER")
@@ -137,6 +190,12 @@ def main():
     except Exception as e:
         print_error(f"Database connection failed: {e}")
         return 1
+    
+    # Check and fix migration order conflicts FIRST
+    try:
+        check_migration_order_conflicts()
+    except Exception as e:
+        print_warning(f"Migration order check failed (non-fatal): {e}")
     
     print_info("Analyzing unapplied migrations...")
     unapplied = get_unapplied_migrations()

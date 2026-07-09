@@ -22,27 +22,14 @@ class DGSetDatasheetGenerator:
         self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # PDF Extraction
+    # Document Extraction (multi-format)
     # ──────────────────────────────────────────────────────────────────────────
     def extract_text_from_pdf(self, pdf_file) -> str:
-        """Extract all text from an uploaded PDF file."""
-        try:
-            pdf_file.seek(0)
-            reader = PyPDF2.PdfReader(pdf_file)
-            text = ""
-            logger.info(f"[DGSetDatasheet] PDF has {len(reader.pages)} pages")
-            for i, page in enumerate(reader.pages, 1):
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-                    logger.info(f"[DGSetDatasheet] Page {i}: {len(page_text)} chars")
-                else:
-                    logger.warning(f"[DGSetDatasheet] Page {i}: no text (image-based?)")
-            logger.info(f"[DGSetDatasheet] Total: {len(text)} chars")
-            return text
-        except Exception as e:
-            logger.error(f"[DGSetDatasheet] PDF extraction error: {e}", exc_info=True)
-            return ""
+        """Extract text from any supported document type."""
+        from .document_extractor import extract_text
+        text = extract_text(pdf_file)
+        logger.info(f"[DGSetDatasheet] Extracted {len(text)} chars from {getattr(pdf_file, 'name', '?')}")
+        return text
 
     # ──────────────────────────────────────────────────────────────────────────
     # Main entry point

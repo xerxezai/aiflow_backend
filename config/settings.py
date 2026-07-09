@@ -83,6 +83,19 @@ SECRET_KEY = config('SECRET_KEY', default='django-insecure-change-this-in-produc
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = safe_cast_bool(config('DEBUG', default='False'), False)
 
+# Validate SECRET_KEY in production (after DEBUG is defined)
+if not DEBUG and SECRET_KEY == 'django-insecure-change-this-in-production':
+    print("\n" + "="*70)
+    print("🚨 SECURITY WARNING: Using default SECRET_KEY in production!")
+    print("="*70)
+    print("Set SECRET_KEY environment variable in Railway:")
+    print("  1. Go to Railway → aiflowbackend-production → Variables")
+    print("  2. Add: SECRET_KEY = <random-50-character-string>")
+    print("")
+    print("Generate a secure key with:")
+    print("  python -c \"from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())\"")
+    print("="*70 + "\n")
+
 # ================================================================
 # USER MANAGEMENT SECURITY SETTINGS
 # ================================================================
@@ -142,6 +155,7 @@ INSTALLED_APPS = [
     'apps.users',
     'apps.api',
     'apps.rbac',
+    'apps.hr_core',  # HR Core - Unified Employee Master System (Phase 1: Parallel to existing tables)
     
     # Local apps - Features (Plugin Architecture)
     'apps.pid_analysis',
@@ -158,11 +172,24 @@ INSTALLED_APPS = [
     'apps.electrical_datasheet',  # Electrical Datasheet - Transformer & Switchgear Technical Data Sheets
     'apps.usage_tracking',  # Usage Tracking & Metering - Internal Analytics Dashboard
     'apps.wrench_integration',  # Wrench Project Platform Integration
+    'apps.data_mining',  # Data Mining Platform - AI-Powered Data Integration & Transformation (Tableau Prep-style)
     'apps.pid_verification',   # P&ID Quality Checker — deterministic rule engine
     'apps.sld_verification',   # SLD Quality Checker — electrical single line diagram verification
     'apps.pfd_quality',          # PFD Quality Checker — deterministic rule engine
     'apps.cross_recommendation', # Cross PID/PFD recommendation bridge
     'apps.non_teff_metadata',     # Non-TEFF Metadata Extractor — multi-format document metadata extraction
+    'apps.instrument_tools',     # Instrument Tools — IO List / Cable Block Diagram / Cable Schedule (Generator + QC)
+    'apps.instrument_io_workflow',  # Instrument IO List Workflow — CRS-style multi-revision IO List doc handling
+    'apps.spec_customization',   # Spec Customization — Paper Spec PDF extraction (Piping Classes)
+    'apps.marketing_analytics',  # Marketing Analytics — Google Analytics (GA4) real-time dashboard widget
+    'apps.timesheet',            # Time Sheet Analytics — SQL Server attendance integration
+    'apps.project_control',      # Project Management — phased cost dashboards, estimates, documents, AI take-off (stubbed)
+    'apps.invoice_tracker',      # Invoice Tracker — Accounts Receivable register (external + internal) + Excel import + S3 attachments
+    'apps.payroll',              # Payroll Intelligence Platform — validation, audit alerts, project costing, AI insights, chatbot
+    'apps.payroll_engine',       # Payroll Engine — fresh monthly payroll automation (Draft → HR → Finance → Released)
+    'apps.onboarding',           # Onboarding & Offboarding — employee lifecycle management (joining, exit, equipment, documents)
+    'apps.site_visits',          # Site Visit Tracking — GPS-based attendance for off-site engineers
+    'apps.dashboard',             # Personal Dashboard — role-scoped data bundles + AI insights
 ]
 
 # ✨ SMART APP LOADING - Only load apps that exist (prevents deployment crashes)
@@ -208,8 +235,63 @@ MIDDLEWARE = [
     'apps.rbac.middleware.RBACMiddleware',
     'apps.activity.tracker.ActivityMiddleware',  # Activity tracking middleware
     'apps.usage_tracking.middleware.UsageTrackingMiddleware',  # Usage metering - Internal Analytics
+    # AI Champion telemetry — captures every authenticated API request as an
+    # ActivityEvent so the leaderboard / cost dashboard at /admin/ai-champion
+    # receives LIVE data. Soft-coded URL→application/feature mapping; never
+    # raises (telemetry failures are logged but do not break the request).
+    'apps.rbac.ai_champion_middleware.AIChampionTelemetryMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
+# ============================================================================== 
+# AI CHAMPION TELEMETRY (SOFT-CODED)
+# ============================================================================== 
+# Runtime-tunable telemetry controls for platform-wide activity tracking.
+# These values are read by apps.rbac.ai_champion_middleware.AIChampionTelemetryMiddleware
+# and can be adjusted without touching business logic.
+
+AI_CHAMPION_TELEMETRY_ENABLED = config('AI_CHAMPION_TELEMETRY_ENABLED', default=True, cast=bool)
+AI_CHAMPION_API_PREFIX = config('AI_CHAMPION_API_PREFIX', default='/api/v1/')
+
+# Comma-separated env override supported, e.g.
+# AI_CHAMPION_TELEMETRY_EXCLUDE_PREFIXES="health/,auth/,rbac/users/me/"
+AI_CHAMPION_TELEMETRY_EXCLUDE_PREFIXES = [
+    p.strip() for p in config(
+        'AI_CHAMPION_TELEMETRY_EXCLUDE_PREFIXES',
+        default='rbac/ai-champion/,rbac/analytics/,auth/,health/,cors/,rbac/users/me/,notifications/poll'
+    ).split(',') if p.strip()
+]
+
+# Ordered URL substring map: (needle, application_code, module_code)
+# First match wins. Keep broad matches last.
+AI_CHAMPION_TELEMETRY_APPLICATION_MAP = [
+    ('pid-verification', 'pid-verification', 'process'),
+    ('pid_verification', 'pid-verification', 'process'),
+    ('pfd_quality', 'pfd-quality', 'process'),
+    ('pfd_converter', 'pfd-converter', 'process'),
+    ('pfd', 'pfd', 'process'),
+    ('process_datasheet', 'process-datasheet', 'process'),
+    ('equipment', 'equipment-list', 'process'),
+    ('line', 'line-list', 'piping'),
+    ('electrical', 'electrical', 'electrical'),
+    ('instrument', 'instrument', 'instrument'),
+    ('mechanical', 'mechanical', 'mechanical'),
+    ('piping', 'piping', 'piping'),
+    ('qhse', 'qhse', 'qhse'),
+    ('crs', 'crs', 'documents'),
+    ('designiq', 'designiq', 'designiq'),
+    ('finance', 'finance', 'finance'),
+    ('procurement', 'procurement', 'procurement'),
+    ('sales', 'sales', 'sales'),
+    ('wrench', 'wrench-integration', 'integrations'),
+    ('rbac/users', 'user-management', 'admin'),
+    ('rbac/roles', 'rbac-roles', 'admin'),
+    ('rbac/audit', 'audit', 'admin'),
+    ('rbac', 'rbac', 'admin'),
+    ('activity', 'activity-tracking', 'admin'),
+    ('usage_tracking', 'usage-tracking', 'admin'),
+    ('notifications', 'notifications', 'platform'),
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -430,7 +512,9 @@ AUTH_PASSWORD_VALIDATORS = [
 
 # Internationalization
 LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'UTC'
+# Soft-coded: Application timezone for display (default UTC for safety)
+# Set to 'Asia/Dubai' for UAE (UTC+4) or your office timezone
+TIME_ZONE = config('DJANGO_TIME_ZONE', default='UTC')
 USE_I18N = True
 USE_TZ = True
 
@@ -547,7 +631,33 @@ FRONTEND_URL = sanitize_cors_origin(
     config('FRONTEND_URL', default='http://localhost:5173')
 ) or 'http://localhost:5173'  # For email links
 
-# WARNING CRITICAL: DO NOT CHANGE - CORS_ALLOW_ALL_ORIGINS MUST BE FALSE
+# ==============================================================================
+# RAILWAY PRODUCTION SAFETY CHECK
+# ==============================================================================
+# CRITICAL: Detect if we're on Railway production and ensure core domains are set
+IS_RAILWAY = config('RAILWAY_ENVIRONMENT', default='') != ''
+RAILWAY_ENV_NAME = config('RAILWAY_ENVIRONMENT', default='local')
+
+if IS_RAILWAY:
+    print(f"\n[RAILWAY] 🚂 Detected Railway environment: {RAILWAY_ENV_NAME}")
+    print(f"[RAILWAY] Frontend URL: {PRODUCTION_FRONTEND}")
+    print(f"[RAILWAY] Backend URL: {PRODUCTION_BACKEND}")
+    
+    # Ensure production URLs are set correctly for Railway
+    if 'radai.ae' not in PRODUCTION_FRONTEND:
+        print("[RAILWAY] ⚠️  WARNING: FRONTEND_URL does not contain radai.ae")
+        print("[RAILWAY] ⚠️  Using fallback: https://www.radai.ae")
+        PRODUCTION_FRONTEND = 'https://www.radai.ae'
+    
+    if 'railway.app' not in PRODUCTION_BACKEND:
+        print("[RAILWAY] ⚠️  WARNING: BACKEND_URL does not contain railway.app")
+        print("[RAILWAY] ⚠️  Using fallback: https://aiflowbackend-production.up.railway.app")
+        PRODUCTION_BACKEND = 'https://aiflowbackend-production.up.railway.app'
+    
+    print(f"[RAILWAY] ✅ Production URLs validated\n")
+
+# ==============================================================================
+# CORS CONFIGURATION (SOFT-CODED with Railway Safety)
 # Setting this to True will break JWT authentication with credentials
 # Railway Env Var: CORS_ALLOW_ALL_ORIGINS=False (or omit to use default)
 CORS_ALLOW_ALL_ORIGINS = safe_cast_bool(config('CORS_ALLOW_ALL_ORIGINS', default='False'), False)
@@ -656,18 +766,26 @@ else:
 CORS_ALLOW_PRIVATE_NETWORK = True
 
 print("\n" + "="*70)
-# print("[CORS] ====== CORS CONFIGURATION ======")
+print("[CORS] ====== CORS CONFIGURATION ======")
+if IS_RAILWAY:
+    print(f"[CORS] 🚂 Railway Environment: {RAILWAY_ENV_NAME}")
 print("="*70)
 print(f"[CORS] Allow All Origins: {CORS_ALLOW_ALL_ORIGINS}")
 if not CORS_ALLOW_ALL_ORIGINS:
     print(f"[CORS] Allowed Origins Count: {len(CORS_ALLOWED_ORIGINS)}")
     print(f"[CORS] Allowed Origins:")
     for origin in CORS_ALLOWED_ORIGINS:
-        print(f"  - {origin}")
+        # Highlight production domains
+        if 'radai.ae' in origin or 'railway.app' in origin:
+            print(f"  ✅ {origin}  <-- PRODUCTION")
+        else:
+            print(f"  - {origin}")
 print(f"[CORS] Allow Credentials: {CORS_ALLOW_CREDENTIALS}")
 print(f"[CORS] Preflight Max Age: {CORS_PREFLIGHT_MAX_AGE}s")
 print(f"[CORS] Frontend URL: {PRODUCTION_FRONTEND}")
 print(f"[CORS] Backend URL: {PRODUCTION_BACKEND}")
+if IS_RAILWAY:
+    print(f"[CORS] Railway Health Check: {PRODUCTION_BACKEND}/api/v1/health/")
 print("="*70 + "\n")
 
 # ==============================================================================
@@ -886,6 +1004,17 @@ if CELERY_RESULT_BACKEND:
 else:
     print(f"[CELERY] Result Backend: None")
 
+# Celery Beat — scheduled tasks
+# Run daily at 02:00 server time; the task self-skips unless PayrollSchedule.enabled
+# and the calendar day matches the configured day_of_month / days_after_month_end.
+from celery.schedules import crontab  # noqa: E402
+CELERY_BEAT_SCHEDULE = {
+    'auto-generate-monthly-payroll': {
+        'task': 'apps.finance.tasks.auto_generate_monthly_payroll',
+        'schedule': crontab(hour=2, minute=0),
+    },
+}
+
 # ==============================================================================
 # End of Celery Configuration
 # ==============================================================================
@@ -943,9 +1072,10 @@ if USE_S3:
     # 2. IAM Role (EC2, ECS, Lambda) - PREFERRED for production
     # 3. AWS credentials file (~/.aws/credentials)
     
-    # DO NOT SET THESE IN CODE - Use environment variables or IAM roles
-    # AWS_ACCESS_KEY_ID = 'NEVER_HARDCODE_THIS'  ERROR WRONG
-    # AWS_SECRET_ACCESS_KEY = 'NEVER_HARDCODE_THIS'  ERROR WRONG
+    # Expose credentials as settings for explicit boto3 usage (soft-coded)
+    # These are read from environment variables, NEVER hardcoded
+    AWS_ACCESS_KEY_ID = config('AWS_ACCESS_KEY_ID', default='')
+    AWS_SECRET_ACCESS_KEY = config('AWS_SECRET_ACCESS_KEY', default='')
     
     # WARNING CRITICAL: S3 bucket must exist before deployment
     # Railway Env Var: AWS_STORAGE_BUCKET_NAME=user-management-rejlers (production bucket)
@@ -976,6 +1106,9 @@ if USE_S3:
         
         # URL expiration for presigned URLs (1 hour)
         AWS_QUERYSTRING_EXPIRE = 3600
+
+        # Per-feature presigned URL expiry (soft-coded, env-overridable)
+        IO_LIST_PDF_PRESIGN_EXPIRY = int(config('IO_LIST_PDF_PRESIGN_EXPIRY', default='3600'))
         
         # Performance: Connection settings
         AWS_S3_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
@@ -1008,9 +1141,121 @@ else:
     STATIC_URL = '/static/'
     STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
+# ─────────────────────────────────────────────────────────────────────
+# Large-file upload tuning (soft-coded via env vars)
+# ─────────────────────────────────────────────────────────────────────
+# Engineering source documents (P&IDs, spec books, scanned catalogues) can
+# legitimately reach ~1 GB. The defaults below match the frontend cap
+# (VITE_SPEC_MAX_FILE_MB = 1024) and the Gunicorn worker timeout.
+#
+# Override per env without code deploy:
+#   DJANGO_DATA_UPLOAD_MAX_MEMORY_SIZE  → total non-file request body cap (bytes)
+#   DJANGO_FILE_UPLOAD_MAX_MEMORY_SIZE  → in-memory file threshold; above this
+#                                         Django spools to disk via TemporaryFileUploadHandler
+#   DJANGO_DATA_UPLOAD_MAX_NUMBER_FIELDS → multipart field count cap
+# ─────────────────────────────────────────────────────────────────────
+_GB = 1024 * 1024 * 1024
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(
+    config('DJANGO_DATA_UPLOAD_MAX_MEMORY_SIZE', default=str(2 * _GB))
+)  # 2 GB headroom for ~1 GB files + form fields
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(
+    config('DJANGO_FILE_UPLOAD_MAX_MEMORY_SIZE', default=str(5 * 1024 * 1024))
+)  # 5 MB — anything larger streams to a temp file on disk (no RAM blow-up)
+DATA_UPLOAD_MAX_NUMBER_FIELDS = int(
+    config('DJANGO_DATA_UPLOAD_MAX_NUMBER_FIELDS', default='10000')
+)
+FILE_UPLOAD_HANDLERS = [
+    'django.core.files.uploadhandler.TemporaryFileUploadHandler',
+]
+
+# ─────────────────────────────────────────────────────────────────────
+# Wrench → S3 Export — dedicated bucket (soft-coded via env var)
+# Set `WRENCH_S3_BUCKET` in .env / Railway. Falls back to 'wrench-radai'.
+# Used by apps.wrench_integration.s3_service._get_bucket()
+# ─────────────────────────────────────────────────────────────────────
+WRENCH_S3_BUCKET = config('WRENCH_S3_BUCKET', default='wrench-radai')
+
+# ─────────────────────────────────────────────────────────────────────
+# Payroll Intelligence — S3 prefix config (reuses AWS_STORAGE_BUCKET_NAME)
+# Files land in payroll/slips/, payroll/documents/, payroll/exports/
+# ─────────────────────────────────────────────────────────────────────
+PAYROLL_S3_PREFIX          = config('PAYROLL_S3_PREFIX',         default='payroll/slips')
+PAYROLL_DOCS_S3_PREFIX     = config('PAYROLL_DOCS_S3_PREFIX',    default='payroll/documents')
+PAYROLL_EXPORTS_S3_PREFIX  = config('PAYROLL_EXPORTS_S3_PREFIX', default='payroll/exports')
+
+# Mirror mode for project-document exports to S3 (soft-coded, opt-in).
+#   'flat'      → wrench/projects/{order_no}/documents/{doc_no}{ext}   (default)
+#   'genealogy' → wrench/projects/{order_no}/{folder1}/{folder2}/.../{doc_no}{ext}
+# 'genealogy' rebuilds the original R:\Projects folder hierarchy in S3 by
+# honouring each Wrench document's GENEALOGY_STRING. See
+# apps.wrench_integration.s3_documents_service for details.
+WRENCH_S3_MIRROR_MODE = config('WRENCH_S3_MIRROR_MODE', default='flat')
+
 # OpenAI Configuration (existing)
 OPENAI_API_KEY = config('OPENAI_API_KEY', default='')
 OPENAI_MODEL = config('OPENAI_MODEL', default='gpt-4o')
+
+# ==============================================================================
+# PROCUREMENT DOCUMENT EXTRACTION CONFIGURATION (SOFT-CODED)
+# ==============================================================================
+# Extraction method for PO/PR documents:
+#   'tesseract' - Free OCR with regex pattern matching (recommended for cost)
+#   'openai'    - GPT-4o structured extraction (better accuracy, costs $)
+# Override via PROCUREMENT_EXTRACTION_METHOD env var
+PROCUREMENT_EXTRACTION_METHOD = config(
+    'PROCUREMENT_EXTRACTION_METHOD',
+    default='tesseract',
+).lower()
+
+# Tesseract OCR language (for multi-language support)
+PROCUREMENT_OCR_LANG = config('PROCUREMENT_OCR_LANG', default='eng')
+
+# Maximum PDF file size for extraction (bytes) - soft-coded for easy tuning
+PROCUREMENT_MAX_PDF_SIZE = int(config(
+    'PROCUREMENT_MAX_PDF_SIZE',
+    default=10 * 1024 * 1024,  # 10MB default
+))
+
+# Confidence threshold for auto-mapping vendors (0.0 - 1.0)
+# Lower = more lenient matching, Higher = stricter matching
+PROCUREMENT_VENDOR_MATCH_THRESHOLD = float(config(
+    'PROCUREMENT_VENDOR_MATCH_THRESHOLD',
+    default=0.7,  # 70% similarity required
+))
+
+# ==============================================================================
+# PAYROLL WORKFLOW CONFIGURATION (SOFT-CODED)
+# ==============================================================================
+# Super-admin email: this user can unfreeze any master payroll file.
+# Override via PAYROLL_WORKFLOW_SUPERADMIN_EMAIL env var.
+PAYROLL_WORKFLOW_SUPERADMIN_EMAIL = config(
+    'PAYROLL_WORKFLOW_SUPERADMIN_EMAIL',
+    default='tanzeem.agra@rejlers.ae',
+).lower()
+
+# Comma-separated list of HR Manager emails that receive an in-app + email
+# notification whenever a master payroll file is frozen.
+# Add more recipients by updating this env var (no code change needed).
+PAYROLL_FREEZE_NOTIFY_EMAILS = [
+    e.strip().lower()
+    for e in config(
+        'PAYROLL_FREEZE_NOTIFY_EMAILS',
+        default='sanglin.samuel@rejlers.ae',
+    ).split(',')
+    if e.strip()
+]
+
+# SLA thresholds (working days) per workflow stage.
+# Approval Tracker highlights files exceeding these limits.
+# Override any value via environment without a code change.
+PAYROLL_TRACKER_SLA_DAYS = {
+    'draft':            int(config('PAYROLL_SLA_DRAFT',            default=3)),
+    'frozen':           int(config('PAYROLL_SLA_FROZEN',           default=2)),
+    'hr_approved':      int(config('PAYROLL_SLA_HR_APPROVED',      default=3)),
+    'finance_review':   int(config('PAYROLL_SLA_FINANCE_REVIEW',   default=3)),
+    'finance_approved': int(config('PAYROLL_SLA_FINANCE_APPROVED', default=2)),
+    'released':         None,   # terminal stage — no SLA
+}
 
 # ==============================================================================
 # REPORT GENERATION CONFIGURATION (SOFT-CODED)

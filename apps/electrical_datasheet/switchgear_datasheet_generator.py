@@ -20,29 +20,11 @@ class SwitchgearDatasheetGenerator:
         self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
     
     def extract_text_from_pdf(self, pdf_file) -> str:
-        """Extract text from uploaded PDF file"""
-        try:
-            # Reset file pointer to beginning
-            pdf_file.seek(0)
-            
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            text = ""
-            
-            logger.info(f"[SwitchgearDatasheet] PDF has {len(pdf_reader.pages)} pages")
-            
-            for page_num, page in enumerate(pdf_reader.pages, 1):
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-                    logger.info(f"[SwitchgearDatasheet] Page {page_num}: Extracted {len(page_text)} chars")
-                else:
-                    logger.warning(f"[SwitchgearDatasheet] Page {page_num}: No text extracted (might be image-based)")
-            
-            logger.info(f"[SwitchgearDatasheet] Total extracted text: {len(text)} characters")
-            return text
-        except Exception as e:
-            logger.error(f"[SwitchgearDatasheet] PDF extraction error: {e}", exc_info=True)
-            return ""
+        """Extract text from any supported document type (multi-format)."""
+        from .document_extractor import extract_text
+        text = extract_text(pdf_file)
+        logger.info(f"[SwitchgearDatasheet] Extracted {len(text)} chars from {getattr(pdf_file, 'name', '?')}")
+        return text
     
     def generate_datasheet_from_sld(self, pdf_file, project_info: Dict = None) -> Dict:
         """

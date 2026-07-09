@@ -39,7 +39,11 @@ class SystemActivityViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         """Filter activities based on query parameters"""
         queryset = super().get_queryset()
-        
+
+        # Security: non-staff users may only see their own activity
+        if not self.request.user.is_staff and not self.request.user.is_superuser:
+            queryset = queryset.filter(user=self.request.user)
+
         # Filter by date range
         start_date = self.request.query_params.get('start_date')
         end_date = self.request.query_params.get('end_date')

@@ -932,11 +932,12 @@ Please provide your response as JSON with this exact structure:
             
             sld_file = request.FILES['sld_file']
             
-            # Validate file type
-            if not sld_file.name.lower().endswith('.pdf'):
+            # Validate file type (soft-coded supported formats)
+            from .document_extractor import is_supported, SUPPORTED_FORMATS_LABEL
+            if not is_supported(sld_file.name):
                 return Response({
                     'success': False,
-                    'error': 'Only PDF files are supported'
+                    'error': f'Unsupported file type. Supported formats: {SUPPORTED_FORMATS_LABEL}'
                 }, status=status.HTTP_400_BAD_REQUEST)
             
             # Extract project information
@@ -956,6 +957,14 @@ Please provide your response as JSON with this exact structure:
             if not result['success']:
                 return Response(result, status=status.HTTP_400_BAD_REQUEST)
             
+            self._persist_smart_generation(
+                request=request,
+                equipment_type='mv_switchgear',
+                source_files=[{'role': 'sld', 'file': sld_file}],
+                project_info=project_info,
+                result=result,
+                generator=generator,
+            )
             return Response(result, status=status.HTTP_200_OK)
             
         except Exception as e:
@@ -1054,9 +1063,10 @@ Please provide your response as JSON with this exact structure:
 
             sizing_file = request.FILES['sizing_calc_file']
 
-            if not sizing_file.name.lower().endswith('.pdf'):
+            from .document_extractor import is_supported, SUPPORTED_FORMATS_LABEL
+            if not is_supported(sizing_file.name):
                 return Response(
-                    {'success': False, 'error': 'Only PDF files are supported'},
+                    {'success': False, 'error': f'Unsupported file type. Supported formats: {SUPPORTED_FORMATS_LABEL}'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
@@ -1075,6 +1085,15 @@ Please provide your response as JSON with this exact structure:
             if not result['success']:
                 return Response(result, status=status.HTTP_400_BAD_REQUEST)
 
+            # Persist to DB + S3 (best-effort; never block success on storage failure)
+            self._persist_smart_generation(
+                request=request,
+                equipment_type='transformer',
+                source_files=[{'role': 'sizing_calc', 'file': sizing_file}],
+                project_info=project_info,
+                result=result,
+                generator=generator,
+            )
             return Response(result, status=status.HTTP_200_OK)
 
         except Exception as e:
@@ -1171,9 +1190,10 @@ Please provide your response as JSON with this exact structure:
 
             edg_file = request.FILES['edg_sizing_file']
 
-            if not edg_file.name.lower().endswith('.pdf'):
+            from .document_extractor import is_supported, SUPPORTED_FORMATS_LABEL
+            if not is_supported(edg_file.name):
                 return Response(
-                    {'success': False, 'error': 'Only PDF files are supported'},
+                    {'success': False, 'error': f'Unsupported file type. Supported formats: {SUPPORTED_FORMATS_LABEL}'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
@@ -1192,6 +1212,14 @@ Please provide your response as JSON with this exact structure:
             if not result['success']:
                 return Response(result, status=status.HTTP_400_BAD_REQUEST)
 
+            self._persist_smart_generation(
+                request=request,
+                equipment_type='dg_set',
+                source_files=[{'role': 'edg_sizing', 'file': edg_file}],
+                project_info=project_info,
+                result=result,
+                generator=generator,
+            )
             return Response(result, status=status.HTTP_200_OK)
 
         except Exception as e:
@@ -1842,6 +1870,512 @@ Please provide your response as JSON with this exact structure:
         instance.deleted_at = timezone.now()
         instance.deleted_by = self.request.user
         instance.save()
+
+    # ════════════════════════════════════════════════════════════════════
+    # SMART GENERATOR — persistence, history, edit, recheck, share, PDF
+    # ════════════════════════════════════════════════════════════════════
+    def _persist_smart_generation(self, *, request, equipment_type, source_files, project_info, result, generator):
+        """Best-effort persist a successful smart generation (DB + S3).
+
+        Augments `result` dict in-place with `datasheet_id` and `excel_url`.
+        Never raises — storage failures are logged and ignored so the
+        original API response is preserved.
+        """
+        try:
+            from .smart_storage import persist_generation
+            from .models import GeneratedDatasheet  # noqa
+            rows     = result.get('datasheet_rows', []) or []
+            summary  = result.get('summary', {}) or {}
+            variant  = (summary.get('variant') or 'default')
+            title    = project_info.get('variant_title') or project_info.get('equipment_type') or ''
+            metadata = {
+                'project_info':      project_info or {},
+                'original_filename': source_files[0]['file'].name if source_files else '',
+                'extraction_metadata': result.get('extraction_metadata', {}),
+            }
+
+            # Render Excel for permanent storage
+            excel_bytes = None
+            try:
+                buf = generator.export_to_excel(rows, project_info)
+                excel_bytes = buf.getvalue() if hasattr(buf, 'getvalue') else bytes(buf)
+            except Exception as exc:
+                logger.warning(f"[smart_persist] excel render failed: {exc}")
+
+            ds, excel_url = persist_generation(
+                user           = request.user,
+                equipment_type = equipment_type,
+                rows           = rows,
+                summary        = summary,
+                metadata       = metadata,
+                source_files   = source_files,
+                excel_bytes    = excel_bytes,
+                title          = title,
+                variant        = variant,
+            )
+            result['datasheet_id'] = str(ds.id)
+            if excel_url:
+                result['excel_url'] = excel_url
+
+            # Audit log
+            try:
+                from apps.activity.tracker import ActivityTracker
+                ActivityTracker.track(
+                    activity_type = 'datasheet_generated',
+                    user          = request.user,
+                    description   = f"Generated {equipment_type} datasheet ({title or ds.id})",
+                    category      = 'electrical_datasheet',
+                    severity      = 'low',
+                    success       = True,
+                    details       = {'datasheet_id': str(ds.id), 'equipment_type': equipment_type},
+                    request       = request,
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.error(f"[smart_persist] non-fatal: {exc}", exc_info=True)
+
+    # ── helpers ────────────────────────────────────────────────────────
+    def _get_owned_datasheet(self, request, datasheet_id):
+        """Fetch a `GeneratedDatasheet` owned by the current user, else None."""
+        from .models import GeneratedDatasheet
+        try:
+            return GeneratedDatasheet.objects.get(id=datasheet_id, user=request.user)
+        except GeneratedDatasheet.DoesNotExist:
+            return None
+
+    # ── HISTORY ────────────────────────────────────────────────────────
+    @action(detail=False, methods=['get'], url_path='generated')
+    def list_generated(self, request):
+        """Paginated list of the current user's generated datasheets."""
+        from .models import GeneratedDatasheet
+        from .smart_storage import serialize_summary
+
+        try:
+            page  = max(1, int(request.query_params.get('page', 1)))
+            limit = min(100, max(1, int(request.query_params.get('limit', 20))))
+        except ValueError:
+            page, limit = 1, 20
+
+        qs = GeneratedDatasheet.objects.filter(user=request.user)
+
+        equipment = request.query_params.get('equipment_type')
+        if equipment:
+            qs = qs.filter(equipment_type=equipment)
+
+        if request.query_params.get('include_archived', '').lower() not in ('1', 'true', 'yes'):
+            qs = qs.filter(is_archived=False)
+
+        search = (request.query_params.get('search') or '').strip()
+        if search:
+            qs = qs.filter(Q(title__icontains=search) | Q(metadata__icontains=search))
+
+        total = qs.count()
+        offset = (page - 1) * limit
+        items  = qs[offset:offset + limit]
+
+        return Response({
+            'success': True,
+            'data': {
+                'items': [serialize_summary(d) for d in items],
+                'pagination': {
+                    'page':        page,
+                    'limit':       limit,
+                    'total_count': total,
+                    'total_pages': (total + limit - 1) // limit if limit else 0,
+                },
+            },
+        })
+
+    @action(detail=False, methods=['get'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)')
+    def get_generated(self, request, datasheet_id=None):
+        from .smart_storage import serialize_detail
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'success': True, 'data': serialize_detail(ds)})
+
+    @action(detail=False, methods=['delete'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)/archive')
+    def archive_generated(self, request, datasheet_id=None):
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        ds.is_archived = True
+        ds.status      = 'archived'
+        ds.save(update_fields=['is_archived', 'status', 'updated_at'])
+        return Response({'success': True})
+
+    # ── INLINE CELL EDIT ──────────────────────────────────────────────
+    @action(detail=False, methods=['patch'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)/cells')
+    def update_cells(self, request, datasheet_id=None):
+        """Batch update editable cells (vendor_data + rev only).
+
+        Body: {"edits": [{"row_index": int, "column_key": str, "new_value": str}, ...]}
+        """
+        from .models import DatasheetCellEdit, CELL_EDIT_SOURCE_CHOICES
+        from .smart_storage import EDITABLE_COLUMNS, EXCEL_REGEN_DELAY_S
+        from .tasks import regenerate_excel_artifact
+
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        edits = request.data.get('edits') or []
+        if not isinstance(edits, list) or not edits:
+            return Response({'success': False, 'error': 'No edits provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+        rows    = list(ds.rows or [])
+        applied = []
+        errors  = []
+        source  = (request.data.get('source') or 'manual')
+        if source not in dict(CELL_EDIT_SOURCE_CHOICES):
+            source = 'manual'
+
+        for edit in edits:
+            try:
+                row_idx = int(edit.get('row_index'))
+                col_key = str(edit.get('column_key'))
+                new_val = edit.get('new_value', '')
+            except (TypeError, ValueError):
+                errors.append({'edit': edit, 'reason': 'invalid_payload'})
+                continue
+            if col_key not in EDITABLE_COLUMNS:
+                errors.append({'edit': edit, 'reason': 'column_not_editable'})
+                continue
+            if row_idx < 0 or row_idx >= len(rows):
+                errors.append({'edit': edit, 'reason': 'row_out_of_range'})
+                continue
+            old_val = rows[row_idx].get(col_key, '')
+            if str(old_val) == str(new_val):
+                continue  # no-op
+            rows[row_idx][col_key] = new_val
+            DatasheetCellEdit.objects.create(
+                datasheet  = ds,
+                user       = request.user,
+                row_index  = row_idx,
+                column_key = col_key,
+                old_value  = '' if old_val is None else str(old_val),
+                new_value  = '' if new_val is None else str(new_val),
+                source     = source,
+            )
+            applied.append({'row_index': row_idx, 'column_key': col_key})
+
+        if applied:
+            ds.rows = rows
+            # Recompute lightweight summary fields
+            summary = dict(ds.summary or {})
+            data_rows = [r for r in rows if not r.get('is_section')]
+            summary['completed_fields'] = sum(1 for r in data_rows if (r.get('vendor_data') or '').strip())
+            summary['missing_fields']   = sum(1 for r in data_rows if not (r.get('vendor_data') or '').strip())
+            ds.summary = summary
+            ds.save(update_fields=['rows', 'summary', 'updated_at'])
+            # Coalesced regen
+            try:
+                regenerate_excel_artifact.apply_async(args=[str(ds.id)], countdown=EXCEL_REGEN_DELAY_S)
+            except Exception as exc:
+                logger.warning(f"[update_cells] could not enqueue regen: {exc}")
+
+        return Response({'success': True, 'applied': applied, 'errors': errors, 'summary': ds.summary})
+
+    @action(detail=False, methods=['get'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)/cell-edits')
+    def list_cell_edits(self, request, datasheet_id=None):
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        edits = ds.cell_edits.select_related('user')[:500]
+        return Response({
+            'success': True,
+            'edits': [{
+                'id':         e.id,
+                'row_index':  e.row_index,
+                'column_key': e.column_key,
+                'old_value':  e.old_value,
+                'new_value':  e.new_value,
+                'source':     e.source,
+                'user':       e.user.get_full_name() if e.user else 'Unknown',
+                'changed_at': e.changed_at.isoformat(),
+            } for e in edits],
+        })
+
+    # ── RECHECK ───────────────────────────────────────────────────────
+    @action(detail=False, methods=['post'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)/recheck')
+    def recheck(self, request, datasheet_id=None):
+        """Re-run AI extraction on saved source files. Returns a diff (no auto-apply)."""
+        from .smart_storage import smart_storage
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        sources = ds.source_files or []
+        if not sources or not sources[0].get('s3_key'):
+            return Response({'success': False, 'error': 'No source files stored to recheck'}, status=status.HTTP_400_BAD_REQUEST)
+
+        primary = sources[0]
+        tmp_path = smart_storage.download_to_tempfile(primary['s3_key'], suffix=os.path.splitext(primary.get('filename', ''))[1])
+        if not tmp_path:
+            return Response({'success': False, 'error': 'Could not retrieve source from storage'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        try:
+            # Wrap the temp file as a Django-like file object
+            class _Wrap:
+                def __init__(self, path, name):
+                    self._fh = open(path, 'rb')
+                    self.name = name
+                def read(self, *a, **k):  return self._fh.read(*a, **k)
+                def seek(self, *a, **k):  return self._fh.seek(*a, **k)
+                def close(self):          return self._fh.close()
+            wrapped = _Wrap(tmp_path, primary.get('filename', 'source'))
+
+            project_info = (ds.metadata or {}).get('project_info', {}) or {}
+            try:
+                if ds.equipment_type == 'transformer':
+                    from .transformer_datasheet_generator import TransformerDatasheetGenerator
+                    gen = TransformerDatasheetGenerator()
+                    result = gen.generate_datasheet_from_sizing_calc(wrapped, project_info)
+                elif ds.equipment_type == 'dg_set':
+                    from .dg_set_datasheet_generator import DGSetDatasheetGenerator
+                    gen = DGSetDatasheetGenerator()
+                    result = gen.generate_datasheet_from_sizing_calc(wrapped, project_info)
+                elif ds.equipment_type == 'mv_switchgear':
+                    from .switchgear_datasheet_generator import SwitchgearDatasheetGenerator
+                    gen = SwitchgearDatasheetGenerator()
+                    result = gen.generate_datasheet_from_sld(wrapped, project_info)
+                else:
+                    return Response({'success': False, 'error': 'Unsupported equipment type'}, status=status.HTTP_400_BAD_REQUEST)
+            finally:
+                wrapped.close()
+
+            if not result.get('success'):
+                return Response(result, status=status.HTTP_400_BAD_REQUEST)
+
+            new_rows = result.get('datasheet_rows', [])
+            diff = []
+            for i, (old, new) in enumerate(zip(ds.rows or [], new_rows)):
+                for col in ('vendor_data', 'rev'):
+                    o = (old.get(col) or '').strip()
+                    n = (new.get(col) or '').strip()
+                    if o != n:
+                        diff.append({
+                            'row_index':   i,
+                            'description': old.get('description', ''),
+                            'column_key':  col,
+                            'current':     o,
+                            'extracted':   n,
+                        })
+            return Response({
+                'success':           True,
+                'diff':              diff,
+                'extracted_summary': result.get('summary', {}),
+                'extracted_count':   len(new_rows),
+            })
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    # ── REVISIONS ─────────────────────────────────────────────────────
+    @action(detail=False, methods=['get', 'post'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)/snapshots')
+    def snapshots(self, request, datasheet_id=None):
+        from .models import GeneratedDatasheetRevision
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == 'POST':
+            count = ds.snapshots.count()
+            label = request.data.get('label') or f"v{count + 1}"
+            note  = request.data.get('note', '')
+            snap  = GeneratedDatasheetRevision.objects.create(
+                datasheet      = ds,
+                revision_label = label,
+                rows           = ds.rows or [],
+                summary        = ds.summary or {},
+                note           = note,
+                created_by     = request.user,
+            )
+            return Response({'success': True, 'snapshot': {
+                'id': snap.id, 'label': snap.revision_label, 'note': snap.note,
+                'created_at': snap.created_at.isoformat(),
+            }})
+
+        snaps = ds.snapshots.all()[:200]
+        return Response({'success': True, 'snapshots': [{
+            'id':         s.id,
+            'label':      s.revision_label,
+            'note':       s.note,
+            'created_by': s.created_by.get_full_name() if s.created_by else 'Unknown',
+            'created_at': s.created_at.isoformat(),
+        } for s in snaps]})
+
+    @action(detail=False, methods=['get'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)/snapshots/(?P<snap_a>\d+)/compare/(?P<snap_b>\d+)')
+    def compare_snapshots(self, request, datasheet_id=None, snap_a=None, snap_b=None):
+        from .models import GeneratedDatasheetRevision
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            a = GeneratedDatasheetRevision.objects.get(id=snap_a, datasheet=ds)
+            b = GeneratedDatasheetRevision.objects.get(id=snap_b, datasheet=ds)
+        except GeneratedDatasheetRevision.DoesNotExist:
+            return Response({'success': False, 'error': 'Snapshot not found'}, status=status.HTTP_404_NOT_FOUND)
+        diff = []
+        for i, (ra, rb) in enumerate(zip(a.rows or [], b.rows or [])):
+            for col in ('vendor_data', 'rev'):
+                oa, ob = (ra.get(col) or ''), (rb.get(col) or '')
+                if oa != ob:
+                    diff.append({'row_index': i, 'description': ra.get('description', ''), 'column_key': col, 'a': oa, 'b': ob})
+        return Response({'success': True, 'a_label': a.revision_label, 'b_label': b.revision_label, 'diff': diff})
+
+    # ── COMMENTS ──────────────────────────────────────────────────────
+    @action(detail=False, methods=['get', 'post'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)/comments')
+    def cell_comments(self, request, datasheet_id=None):
+        from .models import GeneratedDatasheetCellComment
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == 'POST':
+            text = (request.data.get('text') or '').strip()
+            if not text:
+                return Response({'success': False, 'error': 'Comment text required'}, status=status.HTTP_400_BAD_REQUEST)
+            ri = request.data.get('row_index')
+            ck = request.data.get('column_key', '') or ''
+            c  = GeneratedDatasheetCellComment.objects.create(
+                datasheet  = ds,
+                user       = request.user,
+                row_index  = int(ri) if ri is not None else None,
+                column_key = ck,
+                text       = text,
+            )
+            return Response({'success': True, 'comment': {
+                'id': c.id, 'row_index': c.row_index, 'column_key': c.column_key,
+                'text': c.text, 'user': request.user.get_full_name() or request.user.username,
+                'created_at': c.created_at.isoformat(),
+            }})
+
+        comments = ds.cell_comments.select_related('user').all()
+        return Response({'success': True, 'comments': [{
+            'id': c.id, 'row_index': c.row_index, 'column_key': c.column_key,
+            'text': c.text, 'is_resolved': c.is_resolved,
+            'user': c.user.get_full_name() if c.user else 'Unknown',
+            'created_at': c.created_at.isoformat(),
+        } for c in comments]})
+
+    # ── AI SUGGEST ────────────────────────────────────────────────────
+    @action(detail=False, methods=['post'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)/suggest')
+    def suggest_cell(self, request, datasheet_id=None):
+        """Use AI to propose a value for a single cell, grounded in source text."""
+        from .smart_storage import smart_storage
+        from .document_extractor import extract_text
+        from openai import OpenAI
+
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            row_idx = int(request.data.get('row_index'))
+        except (TypeError, ValueError):
+            return Response({'success': False, 'error': 'row_index required'}, status=status.HTTP_400_BAD_REQUEST)
+        rows = ds.rows or []
+        if row_idx < 0 or row_idx >= len(rows):
+            return Response({'success': False, 'error': 'row_index out of range'}, status=status.HTTP_400_BAD_REQUEST)
+        row = rows[row_idx]
+
+        sources = ds.source_files or []
+        if not sources or not sources[0].get('s3_key'):
+            return Response({'success': False, 'error': 'No source available'}, status=status.HTTP_400_BAD_REQUEST)
+        tmp_path = smart_storage.download_to_tempfile(sources[0]['s3_key'])
+        if not tmp_path:
+            return Response({'success': False, 'error': 'Could not load source'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        try:
+            class _Wrap:
+                def __init__(self, p, n):
+                    self._fh = open(p, 'rb'); self.name = n
+                def read(self, *a, **k): return self._fh.read(*a, **k)
+                def seek(self, *a, **k): return self._fh.seek(*a, **k)
+                def close(self): self._fh.close()
+            w = _Wrap(tmp_path, sources[0].get('filename', 'source'))
+            try:
+                doc_text = extract_text(w)
+            finally:
+                w.close()
+        finally:
+            try: os.unlink(tmp_path)
+            except Exception: pass
+
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        prompt = (
+            f"You are filling a single cell on an electrical datasheet.\n"
+            f"Field: {row.get('description', '')}\n"
+            f"Unit: {row.get('unit', '')}\n"
+            f"Specified design data (for reference): {row.get('required_data', '')}\n\n"
+            f"Source document excerpt (truncated):\n{(doc_text or '')[:6000]}\n\n"
+            "Reply STRICTLY as JSON: {\"suggestion\": \"<value>\", \"confidence\": \"high|medium|low\", "
+            "\"source_excerpt\": \"<short quote from source or empty>\"}. "
+            "If the document does not contain enough info, return suggestion as empty string and confidence \"low\"."
+        )
+        try:
+            resp = client.chat.completions.create(
+                model='gpt-4o-mini',
+                temperature=0.1,
+                max_tokens=400,
+                response_format={'type': 'json_object'},
+                messages=[{'role': 'user', 'content': prompt}],
+            )
+            payload = json.loads(resp.choices[0].message.content)
+        except Exception as exc:
+            logger.error(f"[suggest_cell] AI failed: {exc}", exc_info=True)
+            return Response({'success': False, 'error': 'AI suggestion failed'}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response({'success': True, **payload})
+
+    # ── SHARE LINK ────────────────────────────────────────────────────
+    @action(detail=False, methods=['post'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)/share')
+    def create_share(self, request, datasheet_id=None):
+        from .models import DatasheetShareLink
+        from .smart_storage import SHARE_LINK_TTL_DAYS
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        link = DatasheetShareLink.objects.create(
+            datasheet  = ds,
+            created_by = request.user,
+            expires_at = timezone.now() + timezone.timedelta(days=SHARE_LINK_TTL_DAYS),
+        )
+        return Response({
+            'success': True,
+            'token':   link.token,
+            'expires_at': link.expires_at.isoformat() if link.expires_at else None,
+            'share_path': f'/share/datasheet/{link.token}',
+        })
+
+    # ── PDF EXPORT ────────────────────────────────────────────────────
+    @action(detail=False, methods=['get'], url_path=r'generated/(?P<datasheet_id>[0-9a-f-]+)/excel')
+    def download_generated_excel(self, request, datasheet_id=None):
+        """Stream the latest Excel artifact for a datasheet."""
+        from django.http import HttpResponse
+        from .smart_storage import smart_storage
+        ds = self._get_owned_datasheet(request, datasheet_id)
+        if not ds:
+            return Response({'success': False, 'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        # Re-render fresh from current rows if no S3
+        if ds.excel_s3_key:
+            data = smart_storage.download_to_bytes(ds.excel_s3_key)
+        else:
+            data = None
+        if not data:
+            try:
+                from .tasks import _generator_for
+                gen = _generator_for(ds.equipment_type)
+                buf = gen.export_to_excel(ds.rows or [], (ds.metadata or {}).get('project_info', {}) or {})
+                data = buf.getvalue() if hasattr(buf, 'getvalue') else bytes(buf)
+            except Exception as exc:
+                return Response({'success': False, 'error': f'Render failed: {exc}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        resp = HttpResponse(data, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        fname = (ds.title or f"datasheet_{ds.id}").replace(' ', '_') + '.xlsx'
+        resp['Content-Disposition'] = f'attachment; filename="{fname}"'
+        resp['Access-Control-Expose-Headers'] = 'Content-Disposition'
+        return resp
 
 
 class DatasheetCommentViewSet(viewsets.ModelViewSet):

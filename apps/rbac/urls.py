@@ -6,6 +6,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     OrganizationViewSet, ModuleViewSet, PermissionViewSet,
     RoleViewSet, UserProfileViewSet, AuditLogViewSet, StorageViewSet,
+    AccessRequestViewSet,
     # Analytics ViewSets
     AnalyticsDashboardViewSet, SystemMetricsViewSet, UserActivityAnalyticsViewSet,
     SecurityAlertViewSet, PredictiveInsightViewSet, FeatureUsageAnalyticsViewSet,
@@ -15,6 +16,8 @@ from .views import (
 from .dashboard_views import (
     user_dashboard_stats, user_files_list, user_activity_timeline
 )
+from .ai_champion_views import AIChampionViewSet
+from .activity_report_views import ActivityReportViewSet
 from apps.users.views_password import change_password
 
 router = DefaultRouter()
@@ -26,6 +29,7 @@ router.register(r'roles', RoleViewSet, basename='role')
 router.register(r'users', UserProfileViewSet, basename='user')
 router.register(r'audit-logs', AuditLogViewSet, basename='audit-log')
 router.register(r'storage', StorageViewSet, basename='storage')
+router.register(r'access-requests', AccessRequestViewSet, basename='access-request')
 
 # AI-Powered Analytics
 router.register(r'analytics/dashboard', AnalyticsDashboardViewSet, basename='analytics-dashboard')
@@ -36,6 +40,12 @@ router.register(r'analytics/predictions', PredictiveInsightViewSet, basename='pr
 router.register(r'analytics/feature-usage', FeatureUsageAnalyticsViewSet, basename='feature-usage')
 router.register(r'analytics/error-logs', ErrorLogAnalyticsViewSet, basename='error-logs')
 router.register(r'analytics/health-checks', SystemHealthCheckViewSet, basename='health-checks')
+
+# AI Champion of the Month — gamification, tracking, cost analytics
+router.register(r'ai-champion', AIChampionViewSet, basename='ai-champion')
+
+# Activity Reports — admin-only engagement analytics (weekly, monthly, by-user, by-feature)
+router.register(r'activity-reports', ActivityReportViewSet, basename='activity-reports')
 
 urlpatterns = [
     # User Export — must come BEFORE router.urls to prevent users/{pk}/ swallowing 'export' as a pk

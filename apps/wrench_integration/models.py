@@ -57,14 +57,59 @@ class WrenchConfig(models.Model):
     # Pre-shared token – when set, used directly for every API call (no login required).
     # Wrench's rolling-token mechanism still applies: each response token overwrites this field.
     # Set via the "Inject Token" action; cleared by saving new credentials.
+    #
+    # SECURITY: Stored as a Fernet-encrypted ciphertext (same key derivation as
+    # `encrypted_password`). Always read/write via `get_pre_shared_token()` and
+    # `set_pre_shared_token()` — never access `.pre_shared_token` directly.
     pre_shared_token = models.TextField(
         blank=True, default='',
         help_text=(
-            'Pre-shared Wrench session token (obtained externally from the Wrench team). '
+            'Fernet-encrypted Wrench session token (pre-shared from the Wrench team). '
             'When non-empty, this token is used directly — bypassing the username/password '
-            'login flow. The rolling refresh from each API response keeps it current.'
+            'login flow. The rolling refresh from each API response keeps it current. '
+            'Never stored in plaintext.'
         )
     )
+
+    # ─── Pre-shared token: secure access helpers ──────────────────────────────
+    # All credential I/O goes through these methods so the raw ciphertext never
+    # leaks into application code, logs, or serialiser output. The getter is
+    # backward-compatible: legacy plaintext values are auto-detected, transparently
+    # re-encrypted on first access, and persisted — so existing rows upgrade in place.
+    def get_pre_shared_token(self) -> str:
+        """Return the decrypted pre-shared token (empty string when unset).
+
+        Self-heals legacy plaintext rows: if the stored value isn't valid Fernet
+        ciphertext, treat it as plaintext, re-encrypt, and persist.
+        """
+        from .crypto import decrypt_value, encrypt_value  # local import → no cycle
+        raw = self.pre_shared_token or ''
+        if not raw:
+            return ''
+        try:
+            return decrypt_value(raw)
+        except Exception:
+            # Legacy plaintext — upgrade to ciphertext on the fly.
+            try:
+                self.pre_shared_token = encrypt_value(raw)
+                # Avoid touching `updated_at` and other fields
+                type(self).objects.filter(pk=self.pk).update(
+                    pre_shared_token=self.pre_shared_token
+                )
+            except Exception:
+                # If self-heal fails (e.g. unsaved instance), still surface the
+                # plaintext to keep the integration working.
+                pass
+            return raw
+
+    def set_pre_shared_token(self, plaintext: str) -> None:
+        """Encrypt and store the pre-shared token. Empty input clears the field."""
+        from .crypto import encrypt_value  # local import → no cycle
+        self.pre_shared_token = encrypt_value(plaintext) if plaintext else ''
+
+    def has_pre_shared_token(self) -> bool:
+        """Cheap check that avoids decrypting just to test for presence."""
+        return bool(self.pre_shared_token)
 
     organization_name = models.CharField(max_length=255, blank=True, default='')
     client_id = models.CharField(max_length=255, blank=True, default='')

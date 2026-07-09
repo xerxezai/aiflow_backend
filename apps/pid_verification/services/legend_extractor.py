@@ -130,6 +130,18 @@ STEP 2 — SCHEMA:
   "piping_specs": { "038842": "Carbon Steel ANSI 150#" },
   "instrument_prefixes": ["FI", "FIC", "PI", "TI"],
   "valve_prefixes": ["HV", "FV", "XV", "PV"],
+  "equipment_class_codes": { "V": "Vessel/Drum", "P": "Pump", "E": "Heat Exchanger", "K": "Compressor", "C": "Column", "T": "Tank", "F": "Filter", "H": "Fired Heater" },
+  "general_notes": [
+    "All flanges shall be raised face unless noted otherwise.",
+    "Symbol per drawing reference XYZ-123."
+  ],
+  "drawing_references": [
+    { "ref": "PJ6-EXD-GEN-BQDA-0001", "description": "Legend & Symbols Sheet 1 of 6" },
+    { "ref": "ASME B31.3",          "description": "Process Piping code reference" }
+  ],
+  "tie_in_symbols": [
+    { "symbol": "T1", "description": "Tie-in to existing flow line", "type": "tie_in|battery_limit|off_page|continuation|cloud|hold|future" }
+  ],
   "pid_symbols": [
     {
       "code": "XV-FC",
@@ -172,21 +184,35 @@ CRITICAL EXTRACTION RULES:
              rupture discs, flame arrestors, silencers, strainers (Y, T, basket type)
    EQUIPMENT — vessels (horizontal/vertical), drums, tanks, pumps (centrifugal/reciprocating/
                 gear/screw), compressors, heat exchangers (shell&tube/plate/hairpin),
-                fired heaters, air coolers, columns, reactors, mixers
+                fired heaters, air coolers, columns, reactors, mixers, ejectors, eductors,
+                demisters, mist eliminators, internals, packing, trays, distributors
    ACTUATORS — standalone actuator symbols if shown separately
    SIGNALS — pneumatic signal line, electrical signal, hydraulic signal, capillary tube,
               bus signal, wireless signal, guided-wave — each as a separate entry
    FITTINGS — if shown in a dedicated section
 
-6. For line representation tables: list EVERY line type shown (each row = one entry).
+6. ALSO capture these structured tables if present on this page:
+   EQUIPMENT-CLASS CODES → "equipment_class_codes" dict (e.g. V→Vessel, P→Pump, E→Heat Exchanger,
+                            K→Compressor, C→Column, T→Tank, F→Filter, H→Fired Heater).
+                            Read the equipment item-code legend table directly.
+   GENERAL NOTES         → "general_notes" array.  Capture EVERY numbered or bulleted note
+                            verbatim (e.g. "1. All flanges shall be raised face …").
+   DRAWING / CODE REFS   → "drawing_references" array.  Any cross-sheet drawing number,
+                            specification reference, code reference (ASME, API, ISA),
+                            or "see drawing #" callout shown in title block / notes.
+   TIE-IN / OFF-PAGE     → "tie_in_symbols" array.  Tie-in bubbles, battery-limit symbols,
+                            off-page connectors, continuation arrows, hold-clouds, future
+                            scope clouds — each as one entry with its visible label.
 
-7. For abbreviation/service code tables: list EVERY row — do not truncate.
+7. For line representation tables: list EVERY line type shown (each row = one entry).
 
-8. Do NOT merge similar symbols into one entry to save space.
+8. For abbreviation/service code tables: list EVERY row — do not truncate.
+
+9. Do NOT merge similar symbols into one entry to save space.
    500+ entry pages are normal and expected for comprehensive legend sheets.
 
-9. Populate only fields that have visible content on this page.
-   Return empty [] or {} for sections with no content.
+10. Populate only fields that have visible content on this page.
+    Return empty [] or {} for sections with no content.
 """.strip()
 
 # Electrical-focused prompt — used as a fallback for pages that returned empty
@@ -380,11 +406,14 @@ _LIST_DEDUP_KEY = {
     'abbreviations_process': 'abbr',
     # pid_symbols: each visual variant is a separate entry; dedup by description
     'pid_symbols':           'description',
+    # New soft-coded list fields (added without touching merge core logic):
+    'drawing_references':    'ref',          # cross-sheet drawing / code refs
+    'tie_in_symbols':        'symbol',       # tie-in bubbles, off-page connectors
 }
 # String-list fields deduplicated by value:
-_STRING_LIST_FIELDS = {'instrument_prefixes', 'valve_prefixes'}
+_STRING_LIST_FIELDS = {'instrument_prefixes', 'valve_prefixes', 'general_notes'}
 # Dict-merge fields (later batches override earlier for missing keys):
-_DICT_MERGE_FIELDS = {'service_codes', 'insulation_codes', 'piping_specs'}
+_DICT_MERGE_FIELDS = {'service_codes', 'insulation_codes', 'piping_specs', 'equipment_class_codes'}
 # Nested-object fields (keep the most complete one):
 _NESTED_OBJ_FIELDS = {'line_numbering_piping', 'line_numbering_pipeline'}
 

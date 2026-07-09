@@ -10,14 +10,18 @@ Features:
 - Error handling
 """
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAdminUser
 from rest_framework.response import Response
 from rest_framework import status
 from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
 from django.conf import settings
 from django.utils import timezone
+from django.shortcuts import get_object_or_404
+from django.db.models import Count, Q
 import logging
+
+from apps.core.models import Enquiry
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,55 @@ ENQUIRY_CONFIG = {
     'auto_reply': True,
     'save_to_database': True  # Future: save enquiries to database
 }
+
+# Services for which the `phone` field is not required. Password reset
+# requests originate from /forgot-password where the user typically only
+# knows their email.
+ENQUIRY_SERVICES_WITHOUT_PHONE = {'password-reset'}
+
+# Notification config — which services generate an admin notification, and
+# which notification template to use. Extend when new critical services
+# need admin attention.
+ENQUIRY_NOTIFICATION_TEMPLATE = {
+    'password-reset': 'ENQUIRY_PASSWORD_RESET_REQUEST',
+}
+
+
+def _notify_admins_of_enquiry(enquiry_obj, service, user_email, user_name):
+    """
+    Send an in-app notification to all admin users when a critical enquiry
+    (e.g. password-reset) arrives. Silent no-op for services not listed in
+    ENQUIRY_NOTIFICATION_TEMPLATE.
+    """
+    template_key = ENQUIRY_NOTIFICATION_TEMPLATE.get(service)
+    if not template_key or not enquiry_obj:
+        return
+
+    from django.contrib.auth import get_user_model
+    from apps.notifications.services import NotificationService
+
+    User = get_user_model()
+    admins = User.objects.filter(
+        is_active=True,
+    ).filter(
+        # Django admins OR RBAC admin/super_admin roles
+        # We use is_staff/is_superuser as the widest safe net; role-based
+        # filtering happens in the RBAC layer for finer control if needed.
+        Q(is_superuser=True) | Q(is_staff=True)
+    ).distinct()
+
+    NotificationService.bulk_notify(
+        recipients=admins,
+        template_key=template_key,
+        user_email=user_email,
+        user_name=user_name,
+        action_url=f'/admin/enquiries?enquiry={enquiry_obj.pk}',
+        metadata={
+            'enquiry_id': enquiry_obj.pk,
+            'service':    service,
+            'user_email': user_email,
+        },
+    )
 
 
 @api_view(['POST'])
@@ -71,7 +124,7 @@ def submit_enquiry(request):
             errors['email'] = 'Email is required'
         elif '@' not in email or '.' not in email:
             errors['email'] = 'Invalid email format'
-        if not phone:
+        if not phone and service not in ENQUIRY_SERVICES_WITHOUT_PHONE:
             errors['phone'] = 'Phone number is required'
         if not subject:
             errors['subject'] = 'Subject is required'
@@ -86,7 +139,34 @@ def submit_enquiry(request):
                 'errors': errors,
                 'message': 'Validation failed'
             }, status=status.HTTP_400_BAD_REQUEST)
-        
+
+        # Persist to database (gated by soft-coded flag)
+        enquiry_obj = None
+        if ENQUIRY_CONFIG.get('save_to_database', True):
+            try:
+                enquiry_obj = Enquiry.objects.create(
+                    name=name,
+                    email=email,
+                    phone=phone,
+                    company=company,
+                    subject=subject,
+                    message=message,
+                    service=service,
+                    urgency=urgency if urgency in dict(Enquiry.URGENCY_CHOICES) else 'normal',
+                    source_ip=(request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR') or '').split(',')[0].strip() or None,
+                    user_agent=(request.META.get('HTTP_USER_AGENT') or '')[:400],
+                )
+            except Exception as db_err:
+                logger.error(f'Enquiry DB persist failed (continuing with email): {db_err}')
+
+        # Notify administrators via in-app notification (soft-coded per service)
+        # For password-reset requests this is critical since SMTP may be down;
+        # the notification bell alerts admins so they can action from 9.6 Enquiry.
+        try:
+            _notify_admins_of_enquiry(enquiry_obj, service, email, name)
+        except Exception as notif_err:
+            logger.error(f'Enquiry admin notification failed (continuing): {notif_err}')
+
         # Service name mapping
         service_names = {
             'pid-analysis': 'P&ID Analysis & Verification',
@@ -295,9 +375,12 @@ def submit_enquiry(request):
             reply_to=[email]  # Set customer's email as reply-to
         )
         email_message.attach_alternative(html_content, "text/html")
-        email_message.send(fail_silently=False)
-        
-        logger.info(f"✅ Enquiry submitted: {subject} from {email}")
+        try:
+            email_message.send(fail_silently=False)
+            logger.info(f"✅ Enquiry submitted: {subject} from {email}")
+        except Exception as mail_err:
+            # Email failure must not lose the enquiry — it is already persisted.
+            logger.error(f"⚠️ Enquiry email failed (DB row was saved): {mail_err}")
         
         # Optional: Send auto-reply to customer
         if ENQUIRY_CONFIG['auto_reply']:
@@ -353,7 +436,7 @@ def submit_enquiry(request):
         return Response({
             'success': True,
             'message': 'Your enquiry has been submitted successfully. We will get back to you within 24 hours.',
-            'reference': timezone.now().strftime('%Y%m%d-%H%M%S')
+            'reference': (f'ENQ-{enquiry_obj.id:06d}' if enquiry_obj else timezone.now().strftime('%Y%m%d-%H%M%S'))
         }, status=status.HTTP_200_OK)
         
     except Exception as e:
@@ -363,3 +446,119 @@ def submit_enquiry(request):
             'message': 'Failed to submit enquiry. Please try again or contact us directly at tanzeem.agra@rejlers.ae',
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ============================================================================
+# ADMIN ENDPOINTS — list / detail / update / delete / stats
+# Used by the 9.6 Enquiry admin page (frontend/src/pages/Admin/EnquiryManagement.jsx)
+# ============================================================================
+
+def _serialize_enquiry(e: Enquiry) -> dict:
+    return {
+        'id':          e.id,
+        'reference':   f'ENQ-{e.id:06d}',
+        'name':        e.name,
+        'email':       e.email,
+        'phone':       e.phone,
+        'company':     e.company,
+        'subject':     e.subject,
+        'message':     e.message,
+        'service':     e.service,
+        'urgency':     e.urgency,
+        'status':      e.status,
+        'admin_notes': e.admin_notes,
+        'source_ip':   e.source_ip,
+        'user_agent':  e.user_agent,
+        'created_at':  e.created_at.isoformat() if e.created_at else None,
+        'updated_at':  e.updated_at.isoformat() if e.updated_at else None,
+    }
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def list_enquiries(request):
+    """List enquiries with optional filters: ?status=&urgency=&service=&search=&page=&page_size="""
+    qs = Enquiry.objects.all()
+
+    f_status  = request.query_params.get('status')
+    f_urgency = request.query_params.get('urgency')
+    f_service = request.query_params.get('service')
+    f_search  = request.query_params.get('search', '').strip()
+
+    if f_status:
+        qs = qs.filter(status=f_status)
+    if f_urgency:
+        qs = qs.filter(urgency=f_urgency)
+    if f_service:
+        qs = qs.filter(service=f_service)
+    if f_search:
+        qs = qs.filter(
+            Q(name__icontains=f_search) |
+            Q(email__icontains=f_search) |
+            Q(company__icontains=f_search) |
+            Q(subject__icontains=f_search) |
+            Q(message__icontains=f_search)
+        )
+
+    try:
+        page      = max(1, int(request.query_params.get('page', 1)))
+        page_size = min(100, max(1, int(request.query_params.get('page_size', 25))))
+    except (TypeError, ValueError):
+        page, page_size = 1, 25
+
+    total = qs.count()
+    start = (page - 1) * page_size
+    items = [_serialize_enquiry(e) for e in qs[start:start + page_size]]
+
+    return Response({
+        'success':   True,
+        'count':     total,
+        'page':      page,
+        'page_size': page_size,
+        'results':   items,
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def enquiry_stats(request):
+    """Aggregate counts for dashboard widgets at the top of the admin page."""
+    by_status_qs  = Enquiry.objects.values('status').annotate(c=Count('id'))
+    by_urgency_qs = Enquiry.objects.values('urgency').annotate(c=Count('id'))
+    return Response({
+        'success':   True,
+        'total':     Enquiry.objects.count(),
+        'new':       Enquiry.objects.filter(status='new').count(),
+        'by_status': {row['status']: row['c'] for row in by_status_qs},
+        'by_urgency':{row['urgency']: row['c'] for row in by_urgency_qs},
+    })
+
+
+@api_view(['GET', 'PATCH', 'DELETE'])
+@permission_classes([IsAdminUser])
+def enquiry_detail(request, pk: int):
+    """Retrieve, update (status / admin_notes), or delete a single enquiry."""
+    enquiry = get_object_or_404(Enquiry, pk=pk)
+
+    if request.method == 'GET':
+        return Response({'success': True, 'enquiry': _serialize_enquiry(enquiry)})
+
+    if request.method == 'DELETE':
+        enquiry.delete()
+        return Response({'success': True, 'message': 'Enquiry deleted'})
+
+    # PATCH — only allow safe admin-controlled fields
+    allowed = {'status', 'admin_notes', 'urgency'}
+    payload = {k: v for k, v in (request.data or {}).items() if k in allowed}
+
+    if 'status' in payload and payload['status'] not in dict(Enquiry.STATUS_CHOICES):
+        return Response({'success': False, 'message': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
+    if 'urgency' in payload and payload['urgency'] not in dict(Enquiry.URGENCY_CHOICES):
+        return Response({'success': False, 'message': 'Invalid urgency'}, status=status.HTTP_400_BAD_REQUEST)
+
+    for k, v in payload.items():
+        setattr(enquiry, k, v)
+    enquiry.save(update_fields=list(payload.keys()) + ['updated_at'])
+
+    return Response({'success': True, 'enquiry': _serialize_enquiry(enquiry)})
+

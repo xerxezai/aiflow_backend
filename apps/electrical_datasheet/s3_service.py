@@ -13,6 +13,7 @@ import io
 import os
 import json
 import boto3
+from botocore.client import Config as BotoConfig
 from botocore.exceptions import ClientError
 from django.conf import settings
 from typing import Optional, Dict, Any, List
@@ -27,14 +28,25 @@ class ElectricalDatasheetS3Service:
     def __init__(self):
         self.s3_enabled = getattr(settings, 'USE_S3', False) and getattr(settings, 'S3_READY', False)
         self.bucket_name = getattr(settings, 'AWS_STORAGE_BUCKET_NAME', 'user-management-rejlers')
-        self.region = getattr(settings, 'AWS_S3_REGION_NAME', 'us-east-1')
-        
+        # Default region matches the production bucket (UAE Central). SigV4 +
+        # region-specific endpoint are required so presigned URLs work for
+        # opt-in regions like me-central-1 (otherwise IllegalLocationConstraintException).
+        self.region = getattr(settings, 'AWS_S3_REGION_NAME', 'me-central-1')
+        self.endpoint_url = getattr(settings, 'AWS_S3_ENDPOINT_URL', f'https://s3.{self.region}.amazonaws.com')
+        self.signature_version = getattr(settings, 'AWS_S3_SIGNATURE_VERSION', 's3v4')
+        self.addressing_style  = getattr(settings, 'AWS_S3_ADDRESSING_STYLE',  'virtual')
+
         if self.s3_enabled:
             self.s3_client = boto3.client(
                 's3',
                 region_name=self.region,
+                endpoint_url=self.endpoint_url,
                 aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-                aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY')
+                aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+                config=BotoConfig(
+                    signature_version=self.signature_version,
+                    s3={'addressing_style': self.addressing_style},
+                ),
             )
         else:
             self.s3_client = None

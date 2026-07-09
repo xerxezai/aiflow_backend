@@ -8,7 +8,7 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 from .models import (
     Organization, Module, Permission, Role, RolePermission, RoleModule,
-    UserProfile, UserRole, UserStorage, AuditLog
+    UserProfile, UserRole, UserStorage, AuditLog, AccessRequest
 )
 
 User = get_user_model()
@@ -128,7 +128,7 @@ class RoleSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
     
     def get_user_count(self, obj):
-        return obj.user_profiles.filter(userprofile__is_deleted=False).count()
+        return obj.user_profiles.filter(is_deleted=False).count()
     
     def create(self, validated_data):
         permission_ids = validated_data.pop('permission_ids', [])
@@ -249,14 +249,15 @@ class UserProfileSerializer(serializers.ModelSerializer):
     # Engineering competency profile — stored in metadata['engineer_profile'], no migration needed
     engineer_profile = serializers.SerializerMethodField()
 
-    # User creation fields
+    # User creation fields (used on POST). phone is intentionally NOT redeclared
+    # here so the auto-generated model field stays read+write — otherwise the
+    # Profile page can never re-display a saved phone number after refresh.
     username = serializers.CharField(write_only=True, required=False)
     email = serializers.EmailField(write_only=True, required=False)
     password = serializers.CharField(write_only=True, required=False, min_length=8)
     first_name = serializers.CharField(write_only=True, required=False)
     last_name = serializers.CharField(write_only=True, required=False)
-    phone = serializers.CharField(write_only=True, required=False)
-    
+
     def validate(self, attrs):
         """Validate required fields for creation"""
         import logging
@@ -524,94 +525,107 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 )
         
         # Assign roles based on modules (feature-based access)
+        # SECURITY: Direct per-user module assignment is disabled by default.
+        # When MODULE_ASSIGNMENT_CONFIG['create_custom_roles'] is False the
+        # incoming module_ids are ignored — modules must be granted via a
+        # shared Role. Flip the flag in backend/apps/rbac/rbac_config.py to
+        # re-enable the legacy per-user "custom_<email>" role hack.
         if module_ids:
-            request_user = self.context['request'].user
-            from django.db import transaction
             from apps.rbac.rbac_config import MODULE_ASSIGNMENT_CONFIG, get_custom_role_code, get_custom_role_name
-            
-            logger.info(f"[UserProfile] Processing module assignment for {email}: {len(module_ids)} modules")
-            
-            with transaction.atomic():
-                # Create a unique custom role for this user based on email
-                user_role_code = get_custom_role_code(email)
-                custom_role_name = get_custom_role_name(first_name, last_name)
-                
-                custom_role, created = Role.objects.get_or_create(
-                    code=user_role_code,
-                    defaults={
-                        'name': custom_role_name,
-                        'description': f'Custom role for {email} with selected modules',
-                        'level': MODULE_ASSIGNMENT_CONFIG['custom_role_level'],
-                        'is_active': True
-                    }
+
+            if not MODULE_ASSIGNMENT_CONFIG.get('create_custom_roles', False):
+                logger.warning(
+                    "[UserProfile] Ignoring module_ids for %s — create_custom_roles is disabled. "
+                    "Assign modules via a Role instead.",
+                    email,
                 )
-                
-                if created:
-                    logger.info(f"[UserProfile] Created custom role: {custom_role.name} ({custom_role.code})")
-                else:
-                    logger.info(f"[UserProfile] Using existing custom role: {custom_role.name} ({custom_role.code})")
-                    # Update role name if user name changed
-                    custom_role.name = custom_role_name
-                    custom_role.description = f'Custom role for {email} with selected modules'
-                    custom_role.save()
-                
-                # Assign the custom role to the user
-                user_role, user_role_created = UserRole.objects.get_or_create(
-                    user_profile=profile,
-                    role=custom_role,
-                    defaults={
-                        'assigned_by': request_user,
-                        'is_primary': not role_ids  # Primary if no other roles
-                    }
-                )
-                
-                if user_role_created:
-                    logger.info(f"[UserProfile] Assigned custom role to user (primary: {user_role.is_primary})")
-                
-                # Clear existing module assignments if configured
-                if MODULE_ASSIGNMENT_CONFIG['clear_existing_on_update']:
-                    deleted_modules = RoleModule.objects.filter(role=custom_role).count()
-                    deleted_perms = RolePermission.objects.filter(role=custom_role).count()
-                    RoleModule.objects.filter(role=custom_role).delete()
-                    RolePermission.objects.filter(role=custom_role).delete()
-                    logger.info(f"[UserProfile] Cleared {deleted_modules} existing modules and {deleted_perms} permissions from custom role")
-                
-                # Assign modules to the role
-                modules_assigned = 0
-                for module_id in module_ids:
-                    try:
-                        module = Module.objects.get(id=module_id, is_active=True)
-                        role_module, rm_created = RoleModule.objects.get_or_create(
-                            role=custom_role,
-                            module=module,
-                            defaults={'granted_by': request_user}
-                        )
-                        if rm_created:
-                            modules_assigned += 1
-                            logger.info(f"[UserProfile] Linked module '{module.code}' to role '{custom_role.name}'")
-                    except Module.DoesNotExist:
-                        logger.error(f"[UserProfile] Module with ID {module_id} not found or inactive")
-                
-                logger.info(f"[UserProfile] Total modules assigned: {modules_assigned}/{len(module_ids)}")
-                
-                # Get all permissions for the selected modules and assign them
-                if MODULE_ASSIGNMENT_CONFIG['assign_permissions_automatically']:
-                    permissions = Permission.objects.filter(
-                        module_id__in=module_ids,
-                        is_active=True
+            else:
+                request_user = self.context['request'].user
+                from django.db import transaction
+
+                logger.info(f"[UserProfile] Processing module assignment for {email}: {len(module_ids)} modules")
+
+                with transaction.atomic():
+                    # Create a unique custom role for this user based on email
+                    user_role_code = get_custom_role_code(email)
+                    custom_role_name = get_custom_role_name(first_name, last_name)
+
+                    custom_role, created = Role.objects.get_or_create(
+                        code=user_role_code,
+                        defaults={
+                            'name': custom_role_name,
+                            'description': f'Custom role for {email} with selected modules',
+                            'level': MODULE_ASSIGNMENT_CONFIG['custom_role_level'],
+                            'is_active': True
+                        }
                     )
-                    
-                    permissions_assigned = 0
-                    for permission in permissions:
-                        role_perm, rp_created = RolePermission.objects.get_or_create(
-                            role=custom_role,
-                            permission=permission,
-                            defaults={'granted_by': request_user}
+
+                    if created:
+                        logger.info(f"[UserProfile] Created custom role: {custom_role.name} ({custom_role.code})")
+                    else:
+                        logger.info(f"[UserProfile] Using existing custom role: {custom_role.name} ({custom_role.code})")
+                        # Update role name if user name changed
+                        custom_role.name = custom_role_name
+                        custom_role.description = f'Custom role for {email} with selected modules'
+                        custom_role.save()
+
+                    # Assign the custom role to the user
+                    user_role, user_role_created = UserRole.objects.get_or_create(
+                        user_profile=profile,
+                        role=custom_role,
+                        defaults={
+                            'assigned_by': request_user,
+                            'is_primary': not role_ids  # Primary if no other roles
+                        }
+                    )
+
+                    if user_role_created:
+                        logger.info(f"[UserProfile] Assigned custom role to user (primary: {user_role.is_primary})")
+
+                    # Clear existing module assignments if configured
+                    if MODULE_ASSIGNMENT_CONFIG['clear_existing_on_update']:
+                        deleted_modules = RoleModule.objects.filter(role=custom_role).count()
+                        deleted_perms = RolePermission.objects.filter(role=custom_role).count()
+                        RoleModule.objects.filter(role=custom_role).delete()
+                        RolePermission.objects.filter(role=custom_role).delete()
+                        logger.info(f"[UserProfile] Cleared {deleted_modules} existing modules and {deleted_perms} permissions from custom role")
+
+                    # Assign modules to the role
+                    modules_assigned = 0
+                    for module_id in module_ids:
+                        try:
+                            module = Module.objects.get(id=module_id, is_active=True)
+                            role_module, rm_created = RoleModule.objects.get_or_create(
+                                role=custom_role,
+                                module=module,
+                                defaults={'granted_by': request_user}
+                            )
+                            if rm_created:
+                                modules_assigned += 1
+                                logger.info(f"[UserProfile] Linked module '{module.code}' to role '{custom_role.name}'")
+                        except Module.DoesNotExist:
+                            logger.error(f"[UserProfile] Module with ID {module_id} not found or inactive")
+
+                    logger.info(f"[UserProfile] Total modules assigned: {modules_assigned}/{len(module_ids)}")
+
+                    # Get all permissions for the selected modules and assign them
+                    if MODULE_ASSIGNMENT_CONFIG['assign_permissions_automatically']:
+                        permissions = Permission.objects.filter(
+                            module_id__in=module_ids,
+                            is_active=True
                         )
-                        if rp_created:
-                            permissions_assigned += 1
-                    
-                    logger.info(f"[UserProfile] Assigned {permissions_assigned} permissions to custom role")
+
+                        permissions_assigned = 0
+                        for permission in permissions:
+                            role_perm, rp_created = RolePermission.objects.get_or_create(
+                                role=custom_role,
+                                permission=permission,
+                                defaults={'granted_by': request_user}
+                            )
+                            if rp_created:
+                                permissions_assigned += 1
+
+                        logger.info(f"[UserProfile] Assigned {permissions_assigned} permissions to custom role")
         
         # Send email verification if enabled (fail gracefully - don't block user creation)
         from django.conf import settings
@@ -705,30 +719,58 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
 class UserProfileListSerializer(serializers.ModelSerializer):
     """
-    Optimized user profile serializer for lists
-    
-    Performance Optimization:
-    - Uses prefetched data from queryset (no additional DB queries)
-    - Caches full_name and primary_role computation
-    - Reduces response time from 90s to <2s for 276 users
+    Optimized user profile serializer for lists.
+
+    Performance:
+    - Uses prefetched user + organization (no extra DB queries).
+    - Caches full_name and primary_role computation.
+    - <2s response for 276 users.
+
+    Field selection (soft-coded — append-only; never remove without bumping API version):
+    Core identity comes nested on `user` (matches detail serializer shape so the
+    same frontend code paths work for list and detail responses without forks).
+    Flat aliases (email, full_name, first_name, last_name) are kept for
+    backward compatibility with callers that read the legacy flat shape.
     """
+    # ── Identity (flat aliases — legacy callers depend on these) ───────────
     email = serializers.EmailField(source='user.email', read_only=True)
+    first_name = serializers.CharField(source='user.first_name', read_only=True)
+    last_name = serializers.CharField(source='user.last_name', read_only=True)
     full_name = serializers.SerializerMethodField()
+    # ── Identity (nested — matches UserProfileSerializer for shape parity) ─
+    user = UserSerializer(read_only=True)
+    # ── Organisation & roles ───────────────────────────────────────────────
     organization_name = serializers.CharField(source='organization.name', read_only=True)
     primary_role = serializers.SerializerMethodField()
-    
+    # SOFT-CODED: all active roles for the user — uses prefetched userrole_set
+    # so no extra DB query.  Format: [{id, name, code, level}]
+    roles = serializers.SerializerMethodField()
+    # ── HR-facing fields already loaded on UserProfile — no extra query ────
+    profile_photo = serializers.SerializerMethodField()
+
     class Meta:
         model = UserProfile
         fields = [
-            'id', 'email', 'full_name', 'organization_name',
-            'status', 'primary_role', 'employee_id', 'department',
-            'last_login_at', 'created_at'
+            # Identity
+            'id', 'user', 'email', 'first_name', 'last_name', 'full_name',
+            # Organisation / role
+            'organization_name', 'primary_role', 'roles',
+            # Employment
+            'employee_id', 'department', 'job_title',
+            # Contact / location
+            'phone', 'location', 'bio',
+            # Status & security
+            'status', 'is_mfa_enabled',
+            # Media
+            'profile_photo',
+            # Timestamps
+            'last_login_at', 'created_at', 'updated_at',
         ]
-    
+
     def get_full_name(self, obj):
         """Get full name from prefetched user data"""
         return f"{obj.user.first_name} {obj.user.last_name}".strip()
-    
+
     def get_primary_role(self, obj):
         """
         Get primary role from prefetched userrole_set
@@ -743,6 +785,42 @@ class UserProfileListSerializer(serializers.ModelSerializer):
                     'name': user_role.role.name
                 }
         return None
+
+    def get_roles(self, obj):
+        """
+        Return all active roles for this user from prefetched userrole_set.
+        Uses cached data — no additional DB query per user.
+        Format: [{id, name, code, level, is_primary}]
+        """
+        result = []
+        for user_role in obj.userrole_set.all():
+            if user_role.role.is_active:
+                result.append({
+                    'id':         str(user_role.role.id),
+                    'name':       user_role.role.name,
+                    'code':       user_role.role.code,
+                    'level':      user_role.role.level,
+                    'is_primary': user_role.is_primary,
+                })
+        return result
+
+    def get_profile_photo(self, obj):
+        """Return absolute presigned URL for profile photo (same logic as detail serializer)."""
+        if not obj.profile_photo:
+            return None
+        try:
+            url = obj.profile_photo.url
+            if url.startswith('http'):
+                return url
+            request = self.context.get('request')
+            if request:
+                absolute_uri = request.build_absolute_uri(url)
+                if ':5173' in absolute_uri:
+                    absolute_uri = absolute_uri.replace('http://localhost:5173', 'http://localhost:8000')
+                return absolute_uri
+            return url
+        except Exception:
+            return None
 
 
 class UserStorageSerializer(serializers.ModelSerializer):
@@ -790,3 +868,31 @@ class UserModuleCheckSerializer(serializers.Serializer):
     """Serializer for checking user module access"""
     module_code = serializers.CharField()
     has_access = serializers.BooleanField(read_only=True)
+
+
+class AccessRequestSerializer(serializers.ModelSerializer):
+    """Serializer for module access requests."""
+    user_email = serializers.EmailField(source='user_profile.user.email', read_only=True)
+    user_name = serializers.SerializerMethodField()
+    module_name = serializers.CharField(source='module.name', read_only=True)
+    module_code = serializers.CharField(source='module.code', read_only=True)
+    reviewed_by_email = serializers.EmailField(
+        source='reviewed_by.email', read_only=True, allow_null=True
+    )
+
+    class Meta:
+        model = AccessRequest
+        fields = [
+            'id', 'user_profile', 'user_email', 'user_name',
+            'module', 'module_name', 'module_code',
+            'reason', 'status',
+            'reviewed_by', 'reviewed_by_email', 'reviewed_at', 'admin_note',
+            'created_at',
+        ]
+        read_only_fields = [
+            'id', 'status', 'reviewed_by', 'reviewed_at', 'created_at',
+        ]
+
+    def get_user_name(self, obj):
+        u = obj.user_profile.user
+        return f"{u.first_name} {u.last_name}".strip() or u.email

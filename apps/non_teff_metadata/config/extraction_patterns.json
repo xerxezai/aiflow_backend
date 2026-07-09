@@ -10,7 +10,11 @@
 
     "unit": [
       { "pattern": "\\bUNIT[-\\s#]*(?:NO\\.?)?\\s*([0-9]{1,4})\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
-      { "pattern": "\\bU[-\\s]?0?([0-9]{2,3})\\b", "flags": [], "group": 1, "mode": "first" }
+      { "pattern": "\\bU[-\\s]?0?([0-9]{2,3})\\b", "flags": [], "group": 1, "mode": "first" },
+      { "pattern": "\\bACT(?:IVAT(?:E|ED|ION|ING)?|IVE|IVITY|V)?[-\\s]*UNIT\\s*[:\\-]?\\s*([0-9]{2,5}(?:\\s*[A-Z]\\s*[0-9]{1,2})?)\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bUNIT\\s+CODE\\s*[:\\-]?\\s*([0-9]{2,5}(?:\\s*[A-Z]\\s*[0-9]{1,2})?)\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bPLANT\\s+UNIT\\s*[:\\-]?\\s*([0-9]{2,5})\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\b(7[0-9]{3}\\s*[A-Z]\\s*[0-9]{1,2})\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" }
     ],
 
     "adnoc_project_no": [
@@ -27,16 +31,33 @@
       { "pattern": "\\bVENDOR\\s*(?:NAME)?\\s*[:\\-]\\s*([A-Z0-9][A-Z0-9 &.,\\-/()']{2,70})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
       { "pattern": "\\bMANUFACTURER\\s*[:\\-]\\s*([A-Z0-9][A-Z0-9 &.,\\-/()']{2,70})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
       { "pattern": "\\bSUPPLIER\\s*[:\\-]\\s*([A-Z0-9][A-Z0-9 &.,\\-/()']{2,70})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bVENDOR\\s*(?:NAME)?\\s*[\\r\\n]+\\s*([A-Z][A-Z0-9 &.,\\-/()']{3,70})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bVENDOR\\s+([A-Z][A-Z]{2,}(?:\\s+[A-Z][A-Z0-9&.,\\-/()']*){0,6})\\b", "flags": [], "group": 1, "mode": "first" },
+      { "pattern": "\\bMANUFACTURER\\s*[\\r\\n]+\\s*([A-Z][A-Z0-9 &.,\\-/()']{3,70})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bSUPPLIER\\s*[\\r\\n]+\\s*([A-Z][A-Z0-9 &.,\\-/()']{3,70})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\b(?:MFG|MANUFACTURED|MADE|SUPPLIED|FURNISHED)\\s+BY\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 &.,\\-/()']{2,70})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bMAKE\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 &.,\\-/()']{2,70})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bM\\s*/\\s*S\\.?\\s*([A-Z0-9][A-Z0-9 &.,\\-/()']{2,70})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\b(NUOVO\\s+PIGNONE|SNAMPROGETTI|TECNIMONT|FOSTER\\s+WHEELER|SAIPEM|TECHNIP|MITSUBISHI\\s+HEAVY|HITACHI|TOSHIBA|SIEMENS|ABB|GENERAL\\s+ELECTRIC|HONEYWELL|EMERSON|YOKOGAWA|FLOWSERVE|SULZER|EBARA|KSB|GRUNDFOS|ROSEMOUNT|FISHER|MASONEILAN|VELAN|CRANE)\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
       { "pattern": "\\b([A-Z][A-Z &.,\\-']{3,60}\\s+(?:S\\.?P\\.?A\\.?|S\\.?R\\.?L\\.?|LLC|LIMITED|LTD|GMBH|INC|CORP|CO\\.?|COMPANY|B\\.?V\\.?|N\\.?V\\.?|A\\.?G\\.?|PVT))\\b", "flags": [], "group": 1, "mode": "first" }
     ],
 
     "po_no": [
-      { "pattern": "\\b(?:P\\.?O\\.?|PURCHASE\\s+ORDER)\\s*(?:NO\\.?|NUMBER|#)?\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9\\-/]{4,30})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" }
+      { "pattern": "\\bPURCHASE\\s+ORDER\\s*(?:NO\\.?|NUMBER|#)?\\s*[:\\-]\\s*([A-Z0-9][A-Z0-9\\-/]{4,30})\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bP\\.O\\.\\s*(?:NO\\.?|NUMBER|#)\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9\\-/]{4,30})\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bP\\.O\\.\\s*[:\\-]\\s*([A-Z0-9][A-Z0-9\\-/]{4,30})\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bPO\\s*(?:NO\\.?|NUMBER|#)\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9\\-/]{4,30})\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" }
     ],
 
     "contractor_ref": [
       { "pattern": "\\b(?:CONTRACTOR|EPC|MAIN\\s+CONTRACTOR)\\s+(?:DOC(?:UMENT)?\\s+)?(?:REF(?:ERENCE)?\\s+)?(?:NO\\.?|NUMBER|#)?\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9\\-/,]{4,60})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
-      { "pattern": "\\b(7600L[\\- ]?[A-Z0-9\\-]{6,30})\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "all_csv" }
+      { "pattern": "\\bDRAWING\\s*(?:NO\\.?|NUMBER|#)\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9\\-/,_ ]{4,80})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bDR[GW]\\s*(?:NO\\.?|NUMBER|#)?\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9\\-/,_]{4,80})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bD\\.?W\\.?G\\.?\\s*(?:NO\\.?|NUMBER|#)?\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9\\-/,_]{4,80})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\bDOC(?:UMENT)?\\s*(?:NO\\.?|NUMBER|#)\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9\\-/,_]{4,80})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\b(7600L[\\- ]?[A-Z0-9\\-]{6,30})\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "all_csv" },
+      { "pattern": "\\b(NC[\\-_]\\d{2,3}[\\-_]\\d{2}[\\-_]\\d{2,4})\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "all_csv" },
+      { "pattern": "\\b(\\d{2,3}[\\-_]\\d{2,4}[\\-_]\\d{2,4}(?:[\\-_]\\d{2,4})?)\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "all_csv" }
     ],
 
     "vendor_ref": [
@@ -46,7 +67,7 @@
 
     "originator": [
       { "pattern": "\\b(?:FROM|ORIGINATOR|ISSUED\\s+BY|PREPARED\\s+BY)\\s*[:\\-]\\s*([A-Z0-9][A-Z0-9 &.,\\-/()']{2,70})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
-      { "pattern": "\\b(BECHTEL[\\- ]?TECHNIP(?:\\s+JOINT\\s+VENTURE)?|BECHTEL|TECHNIP|SAIPEM|JGC|FLUOR|KENT|WOOD\\s+GROUP|WORLEY|PETROFAC|MCDERMOTT)\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" }
+      { "pattern": "\\b(BECHTEL[\\- ]?TECHNIP(?:\\s+JOINT\\s+VENTURE)?|BECHTEL\\s+LIMITED|BECHTEL|TECHNIP|SAIPEM|JGC|FLUOR|KENT|WOOD\\s+GROUP|WORLEY|PETROFAC|MCDERMOTT|GS\\s+ENGINEERING|HYUNDAI|SAMSUNG|DAEWOO|KBR|JACOBS|AKER|SNAMPROGETTI|CB&I|TOYO|SK\\s+ENGINEERING)\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" }
     ],
 
     "project_location": [
@@ -60,7 +81,8 @@
       { "pattern": "\\b(?:DRAWN|DRAFTED|WRITTEN|ORIGINATED|DESIGNED|CREATED)\\s+BY\\s*[:\\-]?\\s*([A-Z][A-Z &.,\\-']{2,60})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
       { "pattern": "\\b(?:DRAWN|DRWN|DSGN|DESIGN|DESIGNED|PREPARED|CHECKED|CHKD|APPROVED|APPRVD|APPRD|ENGINEER|ENGG)\\s*[:\\-]\\s*([A-Z][A-Z &.,\\-']{2,40})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
       { "pattern": "\\bAUTH(?:OR(?:ED)?)?\\.?\\s*BY\\s*[:\\-]?\\s*([A-Z][A-Z &.,\\-']{2,60})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
-      { "pattern": "\\b(?:NAME|INITIAL|SIGN(?:ED)?)\\s*[:\\-]\\s*([A-Z][A-Z &.,\\-']{2,40})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" }
+      { "pattern": "\\b(?:NAME|INITIAL|SIGN(?:ED)?)\\s*[:\\-]\\s*([A-Z][A-Z &.,\\-']{2,40})", "flags": ["IGNORECASE"], "group": 1, "mode": "first" },
+      { "pattern": "\\b(BECHTEL[\\- ]?TECHNIP(?:\\s+JOINT\\s+VENTURE)?|BECHTEL\\s+LIMITED|BECHTEL|TECHNIP|SAIPEM|JGC|FLUOR|KENT|WOOD\\s+GROUP|WORLEY|PETROFAC|MCDERMOTT|GS\\s+ENGINEERING|HYUNDAI|SAMSUNG|DAEWOO|KBR|JACOBS|AKER|SNAMPROGETTI|CB&I|TOYO|SK\\s+ENGINEERING)\\b", "flags": ["IGNORECASE"], "group": 1, "mode": "first" }
     ],
 
     "agreement_no": [

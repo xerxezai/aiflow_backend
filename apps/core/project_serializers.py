@@ -73,8 +73,10 @@ class ProjectSerializer(serializers.ModelSerializer):
             'id', 'name', 'code', 'description', 'status', 'priority', 'progress',
             'start_date', 'end_date', 'owner', 'owner_id', 'team_members_data',
             'budget', 'spent', 'client_name', 'location', 'tags', 'custom_fields',
+            # Project Dashboard fields — added in migration 0002
+            'contract_value', 'currency', 'scope_type',
             'tasks_summary', 'milestones_summary', 'is_overdue', 'budget_utilization',
-            'team_size', 'created_at', 'updated_at'
+            'team_size', 'created_at', 'updated_at',
         ]
 
     def get_tasks_summary(self, obj):

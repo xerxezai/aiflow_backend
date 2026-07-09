@@ -366,9 +366,12 @@ class SalarySlip(models.Model):
         default=SalaryStatus.DRAFT
     )
     
-    # PDF storage
+    # PDF storage — local path (legacy) + S3 key for cloud-hosted PDFs
     pdf_file_path = models.CharField(max_length=500, blank=True)
     pdf_generated_at = models.DateTimeField(null=True, blank=True)
+    pdf_s3_key = models.CharField(max_length=600, blank=True,
+        help_text='S3 object key for the uploaded PDF (payroll/slips/YYYY/MM/slip.pdf)')
+    pdf_s3_uploaded_at = models.DateTimeField(null=True, blank=True)
     
     # Approval tracking
     approved_by = models.ForeignKey(
@@ -591,3 +594,93 @@ class SalarySlipAuditLog(models.Model):
     
     def __str__(self):
         return f"{self.action} - {self.salary_slip.slip_number} by {self.performed_by}"
+
+
+# ===========================
+# PAYROLL AUTO-SCHEDULE
+# ===========================
+
+class PayrollSchedule(models.Model):
+    """
+    Configuration for automated monthly payroll generation.
+    One global singleton row (id=1) controls the schedule.
+    Celery Beat reads this on each tick to decide whether to fire.
+
+    Workflow triggered when enabled:
+      1. Create PayrollRun for (target_month, target_year)
+      2. Process run → generate SalarySlip records
+      3. Generate PDF for each slip via SalarySlipPDFService
+      4. Upload PDF to S3 via PayrollSlipStorage
+      5. Store S3 key on SalarySlip.pdf_s3_key
+      6. (Optional) send email to each employee
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Toggle
+    enabled = models.BooleanField(
+        default=False,
+        help_text='When True, the Celery Beat task will auto-generate payroll on schedule.',
+    )
+
+    # Schedule — day of month to run (1-28)
+    day_of_month = models.IntegerField(
+        default=1,
+        validators=[MinValueValidator(1), MaxValueValidator(28)],
+        help_text='Day of month on which the task fires (1-28). Default = 1st.',
+    )
+
+    # How many calendar days after month-end to generate (0 = same day, 1 = next day…)
+    days_after_month_end = models.IntegerField(
+        default=0,
+        validators=[MinValueValidator(0), MaxValueValidator(15)],
+        help_text='How many days after month-end to wait before generating. 0 = generate immediately.',
+    )
+
+    # Whether to auto-send emails after generating PDFs
+    auto_send_emails = models.BooleanField(
+        default=False,
+        help_text='When True, emails are queued for all approved slips after generation.',
+    )
+
+    # Notification recipients (comma-separated emails)
+    notify_emails = models.TextField(
+        blank=True,
+        help_text='Comma-separated email addresses to notify on success / failure.',
+    )
+
+    # Last execution metadata
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    last_run_status = models.CharField(
+        max_length=20,
+        blank=True,
+        choices=[('success', 'Success'), ('failed', 'Failed'), ('skipped', 'Skipped')],
+    )
+    last_run_details = models.TextField(blank=True)
+
+    # Audit
+    updated_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payroll_schedule_changes',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'finance_payroll_schedule'
+        verbose_name = 'Payroll Auto-Schedule'
+        verbose_name_plural = 'Payroll Auto-Schedule'
+
+    def __str__(self):
+        state = 'ENABLED' if self.enabled else 'DISABLED'
+        return f'PayrollSchedule [{state}] day={self.day_of_month}'
+
+    @classmethod
+    def get_or_create_singleton(cls):
+        """Return the single schedule config row, creating defaults if absent."""
+        obj, _ = cls.objects.get_or_create(
+            pk=cls.objects.values_list('id', flat=True).first() or uuid.uuid4(),
+        )
+        return obj

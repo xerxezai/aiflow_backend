@@ -140,6 +140,7 @@ urlpatterns = [
     # path('api/v1/core/', include('apps.core.urls')),  # REMOVED: Duplicate - already included via apps.api.urls
     path('api/v1/rbac/', include('apps.rbac.urls')),
     path('api/v1/users/', include('apps.users.urls')),  # User management endpoints
+    path('api/v1/timesheet/', include('apps.timesheet.urls')),  # Time Sheet Analytics (SQL Server)
     path('api/v1/enquiry/', include('apps.core.urls_enquiry')),  # Public enquiry endpoint
     
     # API endpoints - Features (Plugin Architecture)
@@ -147,11 +148,21 @@ urlpatterns = [
     path('api/v1/pfd/', include('apps.pfd_converter.urls')),
     path('api/v1/crs/', include('apps.crs.urls')),
     path('api/v1/finance/', include('apps.finance.urls')),  # Finance Invoice Automation
+    path('api/v1/payroll/', include('apps.payroll.urls')),  # Payroll Intelligence Platform
+    path('api/v1/payroll-engine/', include('apps.payroll_engine.urls')),  # Payroll Engine — monthly automation
+    path('api/v1/onboarding/', include('apps.onboarding.urls')),  # Onboarding & Offboarding — employee lifecycle management
+    path('api/v1/site-visits/', include('apps.site_visits.urls')),  # Site Visit Tracking — GPS attendance for off-site engineers
+    path('api/v1/invoice-tracker/', include('apps.invoice_tracker.urls')),  # Invoice Tracker (A/R) — Excel-driven + S3 attachments
     path('api/v1/designiq/', include('apps.designiq.urls')),  # DesignIQ - AI Design Intelligence
     path('api/v1/process-datasheet/', include('apps.process_datasheet.urls')),  # Process Datasheet
     path('api/v1/electrical-datasheet/', include('apps.electrical_datasheet.urls')),  # Electrical Datasheet with Transformer & Switchgear
     path('api/v1/usage/', include('apps.usage_tracking.urls')),  # Usage Tracking & Internal Analytics
+    path('api/v1/instrument-tools/', include('apps.instrument_tools.urls')),  # Instrument Tools — IO List / Cable Block / Cable Schedule
+    path('api/v1/instrument-io-workflow/', include('apps.instrument_io_workflow.urls')),  # CRS-style multi-revision IO List documents
+    path('api/v1/marketing-analytics/', include('apps.marketing_analytics.urls')),  # GA4 Real-time
     path('api/v1/projects/', include('apps.core.project_urls')),
+    path('api/v1/project-control/', include('apps.project_control.urls')),  # Project Management — cost dashboards, estimates, documents
+    path('api/v1/dashboard/', include('apps.dashboard.urls')),  # Personal Dashboard — role-scoped bundles + AI insights
 ]
 
 # ✨ SMART URL LOADING - Conditionally include optional app URLs
@@ -179,6 +190,11 @@ if is_app_installed('apps.wrench_integration'):
     urlpatterns.append(path('api/v1/wrench/', include('apps.wrench_integration.urls')))
     print("[URL] ✅ Wrench Integration URLs registered")
 
+# Data Mining Platform — AI-powered data integration with Wrench
+if is_app_installed('apps.data_mining'):
+    urlpatterns.append(path('api/v1/data-mining/', include('apps.data_mining.urls')))
+    print("[URL] ✅ Data Mining Platform URLs registered")
+
 # P&ID Verification — deterministic quality checker
 if is_app_installed('apps.pid_verification'):
     urlpatterns.append(path('api/v1/pid-verification/', include('apps.pid_verification.urls')))
@@ -202,6 +218,11 @@ if is_app_installed('apps.cross_recommendation'):
 if is_app_installed('apps.non_teff_metadata'):
     urlpatterns.append(path('api/v1/non-teff/', include('apps.non_teff_metadata.urls')))
     print("[URL] ✅ Cross Recommendation URLs registered")
+
+# Spec Customization — Paper Spec PDF extraction (Piping Classes)
+if is_app_installed('apps.spec_customization'):
+    urlpatterns.append(path('api/v1/spec-customization/', include('apps.spec_customization.urls')))
+    print("[URL] ✅ Spec Customization URLs registered")
 
 # MLflow Model Orchestration API (DISABLED - not in use)
 # urlpatterns.extend([

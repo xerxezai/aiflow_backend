@@ -134,7 +134,39 @@ class SalarySlipPDFService:
         except Exception as e:
             self.logger.error(f"PDF generation failed: {str(e)}")
             raise
-    
+
+    def generate_pdf_bytes(self, salary_slip) -> 'io.BytesIO':
+        """
+        Generate PDF for a salary slip and return the content as a BytesIO buffer.
+        Used by the Celery task so the PDF can be uploaded directly to S3
+        without touching the local filesystem.
+        """
+        import io
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buf,
+            pagesize=self.PDF_CONFIG['page_size'],
+            rightMargin=0.75*inch,
+            leftMargin=0.75*inch,
+            topMargin=0.75*inch,
+            bottomMargin=0.75*inch,
+        )
+        story = []
+        story.extend(self._build_header(salary_slip))
+        story.append(Spacer(1, 0.3*inch))
+        story.extend(self._build_employee_info(salary_slip))
+        story.append(Spacer(1, 0.2*inch))
+        story.extend(self._build_earnings_table(salary_slip))
+        story.append(Spacer(1, 0.2*inch))
+        story.extend(self._build_deductions_table(salary_slip))
+        story.append(Spacer(1, 0.2*inch))
+        story.extend(self._build_net_salary(salary_slip))
+        story.append(Spacer(1, 0.3*inch))
+        story.extend(self._build_footer())
+        doc.build(story)
+        buf.seek(0)
+        return buf
+
     def _build_header(self, salary_slip):
         """Build PDF header with company info"""
         elements = []

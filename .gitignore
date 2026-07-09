@@ -48,6 +48,8 @@ db.sqlite3
 db.sqlite3-journal
 /media
 /staticfiles
+# Runtime upload roots (MEDIA_ROOT subdirs)
+/spec_customization/paper_specs/
 
 # Temporary directories
 temp_sfiles2_*/
@@ -151,3 +153,16 @@ pfd_projects/
 
 # Runtime-generated comparison cache snapshots (UUID-named JSON blobs)
 domain_knowledge/pid_verification/comparison_*.json
+
+# Runtime caches and sample binaries (added 2026-05-06)
+non_teff_batches/
+non_teff_search_cache/
+pid_drawings_advanced/
+_sample.xlsx
+eq_sample.pdf
+eq_test.pdf
+
+
+# Local RBAC audit scratch + preview CSVs (contain employee PII)
+_audit_rbac_current_state.py
+role_alignment_preview_*.csv

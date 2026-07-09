@@ -236,15 +236,31 @@ def _run_in_thread(job_id: str, pdf_path: str, filename: str) -> None:
                 job_id, rows=rows, project_meta=meta,
             ),
         )
-        JobStore.update(
-            job_id,
-            status='done',
-            engine=result.get('engine', 'vision'),
-            page_count=result.get('page_count', 0),
-            rows=result.get('rows', []),
-            project_meta=result.get('project_meta', {}),
-            warnings=result.get('warnings', []),
-        )
+        # Soft-coded: extractor flips status to 'error' when every batch fails
+        # with a fatal OpenAI error (e.g. insufficient_quota). Propagate the
+        # message so the frontend can render it instead of a silent zero-row
+        # result.
+        if result.get('status') == 'error' or result.get('error'):
+            JobStore.update(
+                job_id,
+                status='error',
+                error=result.get('error') or 'Vision extraction failed.',
+                engine=result.get('engine', 'none'),
+                page_count=result.get('page_count', 0),
+                rows=result.get('rows', []),
+                project_meta=result.get('project_meta', {}),
+                warnings=result.get('warnings', []),
+            )
+        else:
+            JobStore.update(
+                job_id,
+                status='done',
+                engine=result.get('engine', 'vision'),
+                page_count=result.get('page_count', 0),
+                rows=result.get('rows', []),
+                project_meta=result.get('project_meta', {}),
+                warnings=result.get('warnings', []),
+            )
     except Exception as exc:                                      # pragma: no cover
         logger.exception('[ValveMTO] job %s crashed', job_id)
         JobStore.update(job_id, status='error', error=str(exc))

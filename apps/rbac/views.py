@@ -12,14 +12,15 @@ from django_filters.rest_framework import DjangoFilterBackend
 
 from .models import (
     Organization, Module, Permission, Role, RolePermission, RoleModule,
-    UserProfile, UserRole, UserStorage, AuditLog
+    UserProfile, UserRole, UserStorage, AuditLog, AccessRequest
 )
 from .serializers import (
     OrganizationSerializer, ModuleSerializer, PermissionSerializer,
     RoleSerializer, RoleListSerializer, RolePermissionSerializer, RoleModuleSerializer,
     UserProfileSerializer, UserProfileListSerializer, UserRoleSerializer,
     UserStorageSerializer, AuditLogSerializer,
-    UserPermissionCheckSerializer, UserModuleCheckSerializer
+    UserPermissionCheckSerializer, UserModuleCheckSerializer,
+    AccessRequestSerializer,
 )
 from .permissions import (
     IsSuperAdmin, IsAdmin, CanManageUsers, CanManageRoles, SameOrganization
@@ -148,7 +149,15 @@ class RoleViewSet(viewsets.ModelViewSet):
     ViewSet for managing roles
     Only super admin can create/edit roles
     """
-    queryset = Role.objects.prefetch_related('permissions', 'modules').all()
+    # SOFT-CODED: custom_role_prefix from rbac_config — roles with this prefix are
+    # per-user auto-generated roles and must not appear in the Role Management UI.
+    # Change the prefix constant in rbac_config.py if the naming scheme ever changes.
+    from apps.rbac.rbac_config import MODULE_ASSIGNMENT_CONFIG as _mac
+    _CUSTOM_PREFIX = _mac.get('custom_role_prefix', 'custom_')
+
+    queryset = Role.objects.prefetch_related('permissions', 'modules', 'user_profiles') \
+                           .filter(is_active=True) \
+                           .exclude(code__startswith=_CUSTOM_PREFIX)
     permission_classes = [IsAuthenticated, CanManageRoles]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
     search_fields = ['name', 'code']
@@ -156,10 +165,17 @@ class RoleViewSet(viewsets.ModelViewSet):
     filterset_fields = ['level', 'is_active']
     
     def get_serializer_class(self):
-        if self.action == 'list':
-            return RoleListSerializer
+        # Use full serializer for all actions — roles are a small dataset (~10-20 rows)
+        # and the list endpoint needs modules + user_count for the Role Management UI
         return RoleSerializer
-    
+
+    def get_permissions(self):
+        # Admins can read roles; only super admin can create/edit/delete
+        if self.action in ['list', 'retrieve', 'assign_module', 'revoke_module',
+                           'assign_permission', 'revoke_permission']:
+            return [IsAuthenticated(), IsAdmin()]
+        return [IsAuthenticated(), CanManageRoles()]
+
     def perform_create(self, serializer):
         role = serializer.save()
         create_audit_log(
@@ -314,6 +330,111 @@ class RoleViewSet(viewsets.ModelViewSet):
         
         return Response({'status': 'module revoked', 'count': deleted_count})
 
+    @action(detail=False, methods=['post'], url_path='sync-default-role',
+            permission_classes=[IsAuthenticated, CanManageRoles])
+    def sync_default_role(self, request):
+        """
+        Assign the Default role to every active UserProfile that has no active
+        role assignment.  Idempotent — safe to call multiple times.
+
+        Returns:
+            assigned (int)  — profiles that received the Default role now
+            skipped  (int)  — profiles that already had at least one active role
+            total    (int)  — total profiles inspected
+        """
+        from apps.rbac.rbac_config import DEFAULT_ROLE_CONFIG
+
+        default_role_code = DEFAULT_ROLE_CONFIG['code']
+
+        # Resolve the Default role
+        try:
+            default_role = Role.objects.get(code=default_role_code, is_active=True)
+        except Role.DoesNotExist:
+            return Response(
+                {'error': f"Default role (code='{default_role_code}') not found or inactive."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Profiles that already have at least one active role
+        profiles_with_role_ids = set(
+            UserRole.objects.filter(role__is_active=True)
+                            .values_list('user_profile_id', flat=True)
+                            .distinct()
+        )
+        roleless_profiles = UserProfile.objects.exclude(id__in=profiles_with_role_ids)
+
+        assigned = 0
+        skipped  = len(profiles_with_role_ids)
+
+        for profile in roleless_profiles.iterator():
+            _, created = UserRole.objects.get_or_create(
+                user_profile=profile,
+                role=default_role,
+                defaults={'is_primary': True, 'assigned_by': request.user},
+            )
+            if created:
+                assigned += 1
+
+        create_audit_log(
+            user=request.user,
+            action='bulk_assign_default_role',
+            resource_type='Role',
+            resource_id=default_role.id,
+            resource_repr=default_role.name,
+            metadata={'assigned': assigned, 'already_had_role': skipped},
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', ''),
+        )
+
+        return Response({
+            'status': 'ok',
+            'assigned': assigned,
+            'skipped':  skipped,
+            'total':    assigned + skipped,
+            'message':  (
+                f"Assigned Default role to {assigned} user(s). "
+                f"{skipped} user(s) already had a role."
+            ),
+        })
+
+    @action(detail=False, methods=['post'], url_path='flush-module-caches',
+            permission_classes=[IsAuthenticated, CanManageRoles])
+    def flush_module_caches(self, request):
+        """
+        Flush cached module/permission lists for ALL users.
+        Call this after changing role membership, deactivating roles, or deploying
+        RBAC fixes so that every user's next API call rebuilds from fresh DB data.
+        Super-admin only. Idempotent and non-destructive.
+        """
+        from django.core.cache import cache
+
+        profile_ids = UserProfile.objects.values_list('id', flat=True)
+        cleared = 0
+        for pid in profile_ids:
+            cache.delete(f'user_modules_{pid}')
+            cache.delete(f'user_permissions_{pid}')
+            cleared += 1
+
+        create_audit_log(
+            user=request.user,
+            action='flush_module_caches',
+            resource_type='Role',
+            resource_id=None,
+            resource_repr='all-users',
+            metadata={'profiles_cleared': cleared},
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', ''),
+        )
+
+        return Response({
+            'status': 'ok',
+            'profiles_cleared': cleared,
+            'message': (
+                f"Module & permission caches cleared for {cleared} user profile(s). "
+                f"Next login / sidebar load will fetch fresh module data."
+            ),
+        })
+
 
 class UserProfileViewSet(viewsets.ModelViewSet):
     """
@@ -343,12 +464,26 @@ class UserProfileViewSet(viewsets.ModelViewSet):
     
     def get_permissions(self):
         """
-        Custom permissions:
-        - 'me' and 'change_password' actions only require authentication
-        - Other actions require user management permissions
+        Permission matrix:
+        - me / change_password / engineers  → authentication only
+        - create / reset_password / activate / deactivate / soft_delete
+          / assign_role / revoke_role       → Super Admin only
+        - Everything else (list, retrieve, partial_update) → Admin or Super Admin
         """
-        if self.action in ['me', 'change_password', 'engineers']:
+        SUPER_ADMIN_ONLY_ACTIONS = {
+            'create', 'reset_password', 'activate', 'deactivate', 'soft_delete',
+        }
+        # Admin (level 2+) can assign/revoke roles — but the action itself guards
+        # against assigning the super_admin role without super_admin privileges
+        ADMIN_ACTIONS = {'assign_role', 'revoke_role'}
+        AUTH_ONLY_ACTIONS = {'me', 'change_password', 'engineers'}
+
+        if self.action in AUTH_ONLY_ACTIONS:
             return [IsAuthenticated()]
+        if self.action in SUPER_ADMIN_ONLY_ACTIONS:
+            return [IsAuthenticated(), IsSuperAdmin()]
+        if self.action in ADMIN_ACTIONS:
+            return [IsAuthenticated(), IsAdmin()]
         return [IsAuthenticated(), CanManageUsers()]
     
     def get_queryset(self):
@@ -377,14 +512,20 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         except UserProfile.DoesNotExist:
             return UserProfile.objects.none()
         
+        # Optional: filter by role code — used by Role Management UI
+        role_code = self.request.query_params.get('role')
+        if role_code:
+            queryset = queryset.filter(roles__code=role_code, roles__is_active=True)
+
         return queryset
-    
+
     def get_serializer_class(self):
         if self.action == 'list':
             return UserProfileListSerializer
         return UserProfileSerializer
-    
+
     def perform_create(self, serializer):
+        from apps.rbac.rbac_config import DEFAULT_ROLE_CONFIG
         profile = serializer.save()
         create_audit_log(
             user=self.request.user,
@@ -395,6 +536,19 @@ class UserProfileViewSet(viewsets.ModelViewSet):
             ip_address=self.request.META.get('REMOTE_ADDR'),
             user_agent=self.request.META.get('HTTP_USER_AGENT', '')
         )
+        # Auto-assign the Default role when no role has been set yet
+        if not profile.userrole_set.filter(role__is_active=True).exists():
+            try:
+                default_role = Role.objects.get(
+                    code=DEFAULT_ROLE_CONFIG['code'], is_active=True
+                )
+                UserRole.objects.get_or_create(
+                    user_profile=profile,
+                    role=default_role,
+                    defaults={'is_primary': True, 'assigned_by': self.request.user},
+                )
+            except Role.DoesNotExist:
+                pass
     
     def perform_update(self, serializer):
         profile = serializer.save()
@@ -590,58 +744,107 @@ class UserProfileViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def assign_role(self, request, pk=None):
-        """Assign role to user"""
+        """Assign role to user.
+
+        Super Admins can assign any role including super_admin.
+        Admins can assign any role except super_admin.
+        """
         profile = self.get_object()
         role_id = request.data.get('role_id')
         is_primary = request.data.get('is_primary', False)
-        
+
         if not role_id:
             return Response(
                 {'error': 'role_id is required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
         try:
             role = Role.objects.get(id=role_id)
-            user_role, created = UserRole.objects.get_or_create(
-                user_profile=profile,
-                role=role,
-                defaults={'assigned_by': request.user, 'is_primary': is_primary}
-            )
-            
-            create_audit_log(
-                user=request.user,
-                action='role_assign',
-                resource_type='UserProfile',
-                resource_id=profile.id,
-                resource_repr=str(profile),
-                metadata={'role': role.name},
-                ip_address=request.META.get('REMOTE_ADDR'),
-                user_agent=request.META.get('HTTP_USER_AGENT', '')
-            )
-            
-            return Response({
-                'status': 'created' if created else 'already_exists',
-                'role': role.name
-            })
         except Role.DoesNotExist:
             return Response(
                 {'error': 'Role not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
-    
+
+        # Guard: only super admin may assign the super_admin role
+        PROTECTED_ROLE_CODES = {'super_admin'}
+        if role.code in PROTECTED_ROLE_CODES:
+            requester_is_super_admin = (
+                request.user.is_superuser
+                or (
+                    hasattr(request.user, 'rbac_profile')
+                    and request.user.rbac_profile.roles.filter(
+                        code='super_admin', is_active=True
+                    ).exists()
+                )
+            )
+            if not requester_is_super_admin:
+                return Response(
+                    {'error': 'Only Super Administrators can assign the Super Admin role.'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        user_role, created = UserRole.objects.get_or_create(
+            user_profile=profile,
+            role=role,
+            defaults={'assigned_by': request.user, 'is_primary': is_primary}
+        )
+
+        create_audit_log(
+            user=request.user,
+            action='role_assign',
+            resource_type='UserProfile',
+            resource_id=profile.id,
+            resource_repr=str(profile),
+            metadata={'role': role.name},
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+
+        return Response({
+            'status': 'created' if created else 'already_exists',
+            'role': role.name
+        })
+
     @action(detail=True, methods=['post'])
     def revoke_role(self, request, pk=None):
-        """Revoke role from user"""
+        """Revoke role from user.
+
+        Super Admins can revoke any role including super_admin.
+        Admins can revoke any role except super_admin.
+        """
         profile = self.get_object()
         role_id = request.data.get('role_id')
-        
+
         if not role_id:
             return Response(
                 {'error': 'role_id is required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
+        # Guard: only super admin may revoke the super_admin role
+        PROTECTED_ROLE_CODES = {'super_admin'}
+        try:
+            target_role = Role.objects.get(id=role_id)
+            if target_role.code in PROTECTED_ROLE_CODES:
+                requester_is_super_admin = (
+                    request.user.is_superuser
+                    or (
+                        hasattr(request.user, 'rbac_profile')
+                        and request.user.rbac_profile.roles.filter(
+                            code='super_admin', is_active=True
+                        ).exists()
+                    )
+                )
+                if not requester_is_super_admin:
+                    return Response(
+                        {'error': 'Only Super Administrators can revoke the Super Admin role.'},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+        except Role.DoesNotExist:
+            pass  # Role not found — the delete below will simply affect 0 rows
+
         deleted_count = UserRole.objects.filter(
             user_profile=profile,
             role_id=role_id
@@ -660,9 +863,58 @@ class UserProfileViewSet(viewsets.ModelViewSet):
             )
         
         return Response({'status': 'role revoked', 'count': deleted_count})
-    
-    @action(detail=False, methods=['post'])
-    def bulk_upload(self, request):
+
+    @action(detail=True, methods=['post'])
+    def set_primary_role(self, request, pk=None):
+        """Mark a specific role as the primary role for this user.
+
+        Sets the given role's UserRole.is_primary = True and all other
+        UserRole entries for this user to is_primary = False.
+        """
+        profile = self.get_object()
+        role_id = request.data.get('role_id')
+
+        if not role_id:
+            return Response(
+                {'error': 'role_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            role = Role.objects.get(id=role_id, is_active=True)
+        except Role.DoesNotExist:
+            return Response(
+                {'error': 'Role not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        try:
+            user_role = UserRole.objects.get(user_profile=profile, role=role)
+        except UserRole.DoesNotExist:
+            return Response(
+                {'error': 'This role is not assigned to the user'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Demote all other roles for this user, then promote the target
+        UserRole.objects.filter(user_profile=profile).update(is_primary=False)
+        user_role.is_primary = True
+        user_role.save(update_fields=['is_primary'])
+
+        create_audit_log(
+            user=request.user,
+            action='role_set_primary',
+            resource_type='UserProfile',
+            resource_id=profile.id,
+            resource_repr=str(profile),
+            metadata={'role': role.name, 'role_id': str(role.id)},
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+
+        return Response({'status': 'primary role updated', 'role': role.name})
+
+
         """
         Bulk upload users from CSV/Excel with Email Notifications
         Expected CSV format: email,first_name,last_name,password,department,job_title,phone,role_codes,module_codes
@@ -804,6 +1056,20 @@ class UserProfileViewSet(viewsets.ModelViewSet):
                                     assigned_by=request.user,
                                     is_primary=(idx == 0)
                                 )
+                        else:
+                            # No role specified — auto-assign the Default role
+                            from apps.rbac.rbac_config import DEFAULT_ROLE_CONFIG
+                            try:
+                                default_role = Role.objects.get(
+                                    code=DEFAULT_ROLE_CONFIG['code'], is_active=True
+                                )
+                                UserRole.objects.get_or_create(
+                                    user_profile=profile,
+                                    role=default_role,
+                                    defaults={'assigned_by': request.user, 'is_primary': True},
+                                )
+                            except Role.DoesNotExist:
+                                pass
                         
                         # Assign modules
                         module_codes = row.get('module_codes', '').strip()
@@ -1748,6 +2014,14 @@ class AnalyticsDashboardViewSet(viewsets.ViewSet):
         Get comprehensive dashboard overview
         Includes system health, user stats, security alerts, and AI insights
         """
+        # Refresh analytics snapshots (TTL-gated, soft-coded intervals).
+        # This only ingests live data — it does not alter the read logic below.
+        try:
+            from .analytics_collectors import ensure_fresh
+            ensure_fresh()
+        except Exception:  # never let collector failure break the dashboard
+            pass
+
         today = timezone.now().date()
         yesterday = today - timedelta(days=1)
         
@@ -2352,3 +2626,139 @@ class UserExportView(APIView):
                 writer.writerow(build_row(p))
 
         return response
+
+
+# ---------------------------------------------------------------------------
+# Access Request ViewSet
+# ---------------------------------------------------------------------------
+
+class AccessRequestViewSet(viewsets.ModelViewSet):
+    """
+    Module access requests submitted by regular users.
+
+    - Regular users: create and view their own requests.
+    - Admins / Super Admins: view all requests; approve or deny via custom actions.
+    """
+
+    serializer_class   = AccessRequestSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends    = [filters.OrderingFilter, DjangoFilterBackend]
+    filterset_fields   = ['status', 'module']
+    ordering_fields    = ['created_at']
+    ordering           = ['-created_at']
+
+    # Soft-coded: roles that can see/manage all requests
+    MANAGER_ROLE_CODES = ['super_admin', 'admin']
+
+    def _is_manager(self, user):
+        """Return True if user is superuser or holds a manager-level role."""
+        if user.is_superuser:
+            return True
+        try:
+            return user.rbac_profile.roles.filter(
+                code__in=self.MANAGER_ROLE_CODES, is_active=True
+            ).exists()
+        except UserProfile.DoesNotExist:
+            return False
+
+    def get_queryset(self):
+        user = self.request.user
+        base_qs = AccessRequest.objects.select_related(
+            'user_profile__user', 'module', 'reviewed_by'
+        )
+        if self._is_manager(user):
+            return base_qs.all()
+        try:
+            return base_qs.filter(user_profile=user.rbac_profile)
+        except UserProfile.DoesNotExist:
+            return AccessRequest.objects.none()
+
+    def perform_create(self, serializer):
+        try:
+            profile = self.request.user.rbac_profile
+        except UserProfile.DoesNotExist:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('User profile not found.')
+
+        module_id = self.request.data.get('module')
+        # Guard: prevent duplicate pending requests for the same module
+        if AccessRequest.objects.filter(
+            user_profile=profile,
+            module_id=module_id,
+            status=AccessRequest.STATUS_PENDING,
+        ).exists():
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError(
+                {'detail': 'A pending request for this module already exists.'}
+            )
+        serializer.save(user_profile=profile)
+
+    # ------------------------------------------------------------------
+    # Admin actions: approve / deny
+    # ------------------------------------------------------------------
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        if not self._is_manager(request.user):
+            return Response(
+                {'detail': 'Only admins can approve access requests.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        req = self.get_object()
+        if req.status != AccessRequest.STATUS_PENDING:
+            return Response(
+                {'detail': f'Request is already {req.status}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        req.status      = AccessRequest.STATUS_APPROVED
+        req.reviewed_by = request.user
+        req.reviewed_at = timezone.now()
+        req.admin_note  = request.data.get('admin_note', '')
+        req.save()
+
+        # Grant access: ensure the user's viewer role has the module, then
+        # also assign the module directly to the user's viewer UserRole.
+        try:
+            from django.core.cache import cache
+            viewer_role = Role.objects.get(code='viewer')
+            RoleModule.objects.get_or_create(role=viewer_role, module=req.module)
+            # If the user already has the viewer role, the cache clear is enough
+            UserRole.objects.get_or_create(
+                user_profile=req.user_profile,
+                role=viewer_role,
+                defaults={'is_primary': False},
+            )
+            cache.delete(f'user_modules_{req.user_profile.id}')
+        except Exception:
+            pass  # Non-fatal — approval still recorded
+
+        create_audit_log(
+            user=request.user,
+            action='role_assign',
+            resource_type='AccessRequest',
+            resource_id=req.id,
+            resource_repr=str(req),
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', ''),
+        )
+        return Response({'status': 'approved'})
+
+    @action(detail=True, methods=['post'])
+    def deny(self, request, pk=None):
+        if not self._is_manager(request.user):
+            return Response(
+                {'detail': 'Only admins can deny access requests.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        req = self.get_object()
+        if req.status != AccessRequest.STATUS_PENDING:
+            return Response(
+                {'detail': f'Request is already {req.status}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        req.status      = AccessRequest.STATUS_DENIED
+        req.reviewed_by = request.user
+        req.reviewed_at = timezone.now()
+        req.admin_note  = request.data.get('admin_note', '')
+        req.save()
+        return Response({'status': 'denied'})

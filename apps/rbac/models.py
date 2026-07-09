@@ -139,7 +139,7 @@ class Role(TimeStampedModel):
     User roles with hierarchical structure
     """
     ROLE_LEVEL_CHOICES = [
-        (1, 'Super Admin'),
+        (1, 'Super Administrator'),
         (2, 'Admin'),
         (3, 'Manager'),
         (4, 'Engineer'),
@@ -322,11 +322,26 @@ class UserProfile(TimeStampedModel):
     
     def __str__(self):
         return f"{self.user.email} - {self.organization.name}"
+
+    def save(self, *args, **kwargs):
+        # Normalise employee_id so it matches the biometric employee_code
+        # stored in TimesheetEvent / DailyAttendanceSummary / EmployeeLeaveRecord.
+        # Prevents lookup misses caused by trailing spaces entered via the UI.
+        if self.employee_id:
+            try:
+                from apps.timesheet.identity import norm_code
+                self.employee_id = norm_code(self.employee_id)
+            except Exception:
+                self.employee_id = str(self.employee_id).strip()
+        super().save(*args, **kwargs)
     
     def has_permission(self, permission_code):
-        """Check if user has specific permission through any role"""
+        """Check if user has specific permission through any active role"""
         from apps.rbac.models import UserRole
-        user_role_ids = UserRole.objects.filter(user_profile=self).values_list('role_id', flat=True)
+        user_role_ids = UserRole.objects.filter(
+            user_profile=self,
+            role__is_active=True
+        ).values_list('role_id', flat=True)
         return Permission.objects.filter(
             roles__id__in=user_role_ids,
             code=permission_code,
@@ -334,9 +349,12 @@ class UserProfile(TimeStampedModel):
         ).exists()
     
     def has_module_access(self, module_code):
-        """Check if user has access to module through any role"""
+        """Check if user has access to module through any active role"""
         from apps.rbac.models import UserRole
-        user_role_ids = UserRole.objects.filter(user_profile=self).values_list('role_id', flat=True)
+        user_role_ids = UserRole.objects.filter(
+            user_profile=self,
+            role__is_active=True
+        ).values_list('role_id', flat=True)
         return Module.objects.filter(
             roles__id__in=user_role_ids,
             code=module_code,
@@ -351,7 +369,7 @@ class UserProfile(TimeStampedModel):
         
         if permissions is None:
             permissions = list(Permission.objects.filter(
-                roles__in=self.roles.all(),
+                roles__in=self.roles.filter(is_active=True),
                 is_active=True
             ).distinct())
             # Cache for 5 minutes
@@ -366,8 +384,11 @@ class UserProfile(TimeStampedModel):
         modules = cache.get(cache_key)
         
         if modules is None:
-            # Get role IDs through UserRole relationship
-            user_role_ids = UserRole.objects.filter(user_profile=self).values_list('role_id', flat=True)
+            # Get role IDs through UserRole relationship — only active roles
+            user_role_ids = UserRole.objects.filter(
+                user_profile=self,
+                role__is_active=True
+            ).values_list('role_id', flat=True)
             
             # Get modules linked to these roles through RoleModule
             modules = list(Module.objects.filter(
@@ -389,8 +410,8 @@ class UserProfile(TimeStampedModel):
                 # Non-fatal: keep role-based modules if config resolution fails
                 pass
 
-            # Cache for 5 minutes
-            cache.set(cache_key, modules, 300)
+            # Cache for 60 seconds — short TTL so role changes propagate quickly
+            cache.set(cache_key, modules, 60)
         
         return modules
 
@@ -614,3 +635,86 @@ class AuditLog(TimeStampedModel):
     
     def __str__(self):
         return f"{self.user_email} - {self.action} - {self.timestamp}"
+
+
+class AccessRequest(TimeStampedModel):
+    """
+    User-initiated request for additional module access.
+
+    Workflow:
+      1. User submits a request (any authenticated user, via POST /rbac/access-requests/)
+      2. Super Administrator reviews the pending list (/admin/access-requests)
+      3. Admin approves → UserRole for the corresponding module's role is assigned
+         OR Admin denies → status set to 'denied' with an optional admin_note
+
+    All status values are soft-coded in STATUS_CHOICES below.
+    """
+
+    # Soft-coded status labels — update here only
+    STATUS_PENDING  = 'pending'
+    STATUS_APPROVED = 'approved'
+    STATUS_DENIED   = 'denied'
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING,  'Pending Review'),
+        (STATUS_APPROVED, 'Approved'),
+        (STATUS_DENIED,   'Denied'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    user_profile = models.ForeignKey(
+        UserProfile,
+        on_delete=models.CASCADE,
+        related_name='access_requests',
+    )
+    module = models.ForeignKey(
+        Module,
+        on_delete=models.CASCADE,
+        related_name='access_requests',
+    )
+    reason = models.TextField(
+        blank=True,
+        help_text="Why does the user need access to this module?",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=STATUS_PENDING,
+        db_index=True,
+    )
+
+    # Review tracking
+    reviewed_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='reviewed_access_requests',
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    admin_note  = models.TextField(blank=True, help_text="Admin response or reason for denial")
+
+    class Meta:
+        db_table    = 'rbac_access_requests'
+        ordering    = ['-created_at']
+        verbose_name = 'Access Request'
+        verbose_name_plural = 'Access Requests'
+        indexes = [
+            models.Index(fields=['user_profile', 'status']),
+            models.Index(fields=['module',        'status']),
+            models.Index(fields=['status', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.user_profile.user.email} → {self.module.name} ({self.status})"
+
+
+# Re-export models from sibling modules so Django auto-discovery picks them up
+# (analytics_models is already discovered via admin.py import on startup, but explicit is safer)
+from .ai_champion_models import (  # noqa: F401,E402
+    AIPricingConfig,
+    AIUsageLog,
+    ActivityEvent,
+    MonthlyChampion,
+)

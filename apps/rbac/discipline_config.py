@@ -164,6 +164,27 @@ class DisciplineAccessConfig:
             'accessible_by_roles': ['super_admin', 'admin', 'manager', 'engineer'],
             'required_permission': 'ml_detection.use'
         },
+        
+        # Data Mining module
+        'data_mining': {
+            'code': 'data_mining',
+            'name': 'Data Mining Platform',
+            'description': 'Tableau Prep-style data transformation and master file generation',
+            # Soft-coded global toggle: expose Data Mining to all authenticated users.
+            'allow_all_authenticated': True,
+            'accessible_by_disciplines': [
+                'engineering',
+                'process_engineering',
+                'mechanical_engineering',
+                'electrical_engineering',
+                'instruments_control',
+                'qa_qc',
+                'admin',
+                'super_admin',
+            ],
+            'accessible_by_roles': ['super_admin', 'admin', 'manager', 'engineer', 'reviewer'],
+            'required_permission': 'data_mining.use'
+        },
     }
     
     # Discipline definitions
