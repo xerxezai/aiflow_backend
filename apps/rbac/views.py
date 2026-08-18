@@ -188,7 +188,8 @@ class RoleViewSet(viewsets.ModelViewSet):
                                'user_profiles',
                                filter=Q(user_profiles__is_deleted=False),
                                distinct=True,
-                           ))
+                           )) \
+                           .order_by('level', 'name')
     permission_classes = [IsAuthenticated, CanManageRoles]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
     search_fields = ['name', 'code']
