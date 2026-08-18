@@ -49,7 +49,7 @@ class IsAdmin(permissions.BasePermission):
         try:
             profile = request.user.rbac_profile
             return profile.roles.filter(
-                code__in=['super_admin', 'admin', 'ict_admin'],  # ICT Admin added
+                code__in=['super_admin', 'admin', 'ict_admin', 'hr_admin'],  # ICT Admin added
                 is_active=True
             ).exists()
         except UserProfile.DoesNotExist:
