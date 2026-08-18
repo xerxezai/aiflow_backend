@@ -931,7 +931,7 @@ def _is_senior_hr(user) -> bool:
         roles = user.userprofile.roles.all()
         for role in roles:
             code = (role.code or '').lower()
-            if code.startswith('senior_hr') or code in ('admin', 'superadmin', 'manager'):
+            if code.startswith('senior_hr') or code in ('admin', 'superadmin', 'manager', 'hr_admin'):
                 return True
     except Exception:
         pass
