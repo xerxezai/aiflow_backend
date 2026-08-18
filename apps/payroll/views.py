@@ -928,7 +928,7 @@ def _is_senior_hr(user) -> bool:
     if getattr(user, 'is_superuser', False) or getattr(user, 'is_staff', False):
         return True
     try:
-        roles = user.userprofile.roles.all()
+        roles = user.rbac_profile.roles.all()
         for role in roles:
             code = (role.code or '').lower()
             if code.startswith('senior_hr') or code in ('admin', 'superadmin', 'manager', 'hr_admin'):
