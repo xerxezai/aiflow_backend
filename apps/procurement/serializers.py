@@ -229,6 +229,7 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
 
         User = get_user_model()
         normalized_workflow = []
+        assigned_user_ids = set()
 
         for index, stage in enumerate(value):
             if not isinstance(stage, dict):
@@ -252,19 +253,35 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
                 )
 
             try:
-                can_review_requisitions = (
-                    approver.is_superuser
-                    or approver.rbac_profile.has_module_access('procurement_requisitions')
-                )
-            except ObjectDoesNotExist:
-                can_review_requisitions = False
-            if not can_review_requisitions:
+                level = max(1, int(stage.get('level', index + 1)))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError(f'Approval stage {index + 1} has an invalid level.')
+
+            approver_id = str(approver.pk)
+            if approver_id in assigned_user_ids:
                 raise serializers.ValidationError(
-                    f'Approval stage {index + 1} approver requires Purchase Requisitions module access.'
+                    f'Approval stage {index + 1} duplicates an approver already selected in this workflow.'
                 )
+            assigned_user_ids.add(approver_id)
+
+            # Level 1 is intentionally open to every active employee. Later
+            # levels retain module-access validation for operational safety.
+            if level != 1:
+                try:
+                    can_review_requisitions = (
+                        approver.is_superuser
+                        or approver.rbac_profile.has_module_access('procurement_requisitions')
+                    )
+                except ObjectDoesNotExist:
+                    can_review_requisitions = False
+                if not can_review_requisitions:
+                    raise serializers.ValidationError(
+                        f'Approval stage {index + 1} approver requires Purchase Requisitions module access.'
+                    )
 
             normalized_stage = {
                 'step': index + 1,
+                'level': level,
                 'role': role,
                 'user_id': str(approver.pk),
                 'user_name': approver.get_full_name() or approver.email,
@@ -275,6 +292,10 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
             stage_name = str(stage.get('stage') or '').strip()
             if stage_name:
                 normalized_stage['stage'] = stage_name[:150]
+
+            if level == 1:
+                normalized_stage['approval_group'] = 'level_1'
+                normalized_stage['group_mode'] = 'all'
 
             normalized_workflow.append(normalized_stage)
 

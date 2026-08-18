@@ -8,7 +8,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.views import APIView
 from django.utils import timezone
-from django.db.models import Q, Count
+from django.db.models import Q, Count, OuterRef, Subquery, IntegerField
 from django_filters.rest_framework import DjangoFilterBackend
 from django.http import FileResponse
 
@@ -181,22 +181,19 @@ class RoleViewSet(viewsets.ModelViewSet):
     from apps.rbac.rbac_config import MODULE_ASSIGNMENT_CONFIG as _mac
     _CUSTOM_PREFIX = _mac.get('custom_role_prefix', 'custom_')
 
-    queryset = Role.objects.all()
+    user_count_sq = UserProfile.objects.filter(
+        userrole__role=OuterRef('pk'),
+        is_deleted=False,
+    ).values('userrole__role').annotate(cnt=Count('id')).values('cnt')
 
-    def get_queryset(self):
-        from django.db.models import OuterRef, Subquery, IntegerField
-        from apps.rbac.models import UserProfile
-        user_count_subquery = Subquery(
-            UserProfile.objects.filter(
-                roles=OuterRef('pk'),
-                is_deleted=False
-            ).values('roles').annotate(c=Count('id')).values('c'),
-            output_field=IntegerField()
-        )
-        return Role.objects.prefetch_related('permissions', 'modules') \
+    queryset = Role.objects.prefetch_related('permissions', 'modules', 'user_profiles') \
                            .filter(is_active=True) \
-                           .exclude(code__startswith=self._CUSTOM_PREFIX) \
-                           .annotate(user_count_annotated=user_count_subquery)
+                           .exclude(code__startswith=_CUSTOM_PREFIX) \
+                           .annotate(user_count_annotated=Subquery(
+                               user_count_sq,
+                               output_field=IntegerField(),
+                           )) \
+                           .order_by('level', 'name')
     permission_classes = [IsAuthenticated, CanManageRoles]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
     search_fields = ['name', 'code']

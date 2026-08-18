@@ -26,6 +26,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 import io
+import json
 
 class RADAILogoMark(Flowable):
     """Resolution-independent RADAI mark for controlled PDF exports."""
@@ -179,7 +180,16 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
     =��� SECURITY: Requires 'procurement_requisitions' module access (soft-coded from rbac_config.py)
     """
     
-    queryset = PurchaseRequisition.objects.all().order_by('-created_at')
+    queryset = PurchaseRequisition.objects.select_related(
+        'issued_by',
+        'vendor',
+        'requested_by',
+        'approved_by',
+        'pm_name',
+        'eng_manager_name',
+        'manager_projects_name',
+        'vp_op_name',
+    ).all().order_by('-created_at')
     serializer_class = PurchaseRequisitionSerializer
     permission_classes = [IsAuthenticated, HasModuleAccess]
     module_required = 'procurement_requisitions'
@@ -273,6 +283,110 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
         self.perform_create(serializer)
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    @action(
+        detail=False,
+        methods=['post'],
+        url_path='import-excel',
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def import_excel(self, request):
+        """Preview or import Purchase Requisitions from an Excel register."""
+        excel_file = request.FILES.get('file')
+        if not excel_file:
+            return Response(
+                {'error': 'No Excel file provided. Use multipart field "file".'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        dry_run = str(request.data.get('dry_run', 'true')).strip().lower() not in {
+            'false', '0', 'no',
+        }
+
+        from .services.pr_excel_import import (
+            PRExcelImportError,
+            import_pr_workbook,
+        )
+
+        try:
+            result = import_pr_workbook(
+                excel_file,
+                user=request.user,
+                dry_run=dry_run,
+            )
+        except PRExcelImportError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not dry_run and result['ready_rows'] > 0 and result['created_count'] == 0:
+            result['error'] = (
+                'No Purchase Requisitions were created. Review the row errors and '
+                'company database configuration before retrying.'
+            )
+            return Response(result, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+        response_status = status.HTTP_200_OK if dry_run else status.HTTP_201_CREATED
+        return Response(result, status=response_status)
+
+    @action(
+        detail=False,
+        methods=['post'],
+        url_path='import-signed-pdf',
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def import_signed_pdf(self, request):
+        """Capture a signed PR PDF into an existing RADAI requisition."""
+        pdf_file = request.FILES.get('file')
+        if not pdf_file:
+            return Response(
+                {'error': 'Select a signed Purchase Requisition PDF to import.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if pdf_file.size > 15 * 1024 * 1024:
+            return Response({'error': 'PDF file must not exceed 15 MB.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services.signed_pr_pdf_import import (
+            SignedPRImportError,
+            import_signed_pr_pdf,
+            preview_signed_pr_pdf,
+        )
+        approvals = {
+            key: str(request.data.get(f'{key}_name', '')).strip()
+            for key in ('pm', 'moe', 'mop', 'vp')
+        }
+        approvals = {key: value for key, value in approvals.items() if value}
+        try:
+            pdf_bytes = pdf_file.read()
+            expected_pr_number = str(request.data.get('expected_pr_number', '')).strip()
+            if str(request.data.get('preview_only', '')).lower() in {'1', 'true', 'yes'}:
+                result = preview_signed_pr_pdf(
+                    pdf_bytes,
+                    filename=pdf_file.name,
+                    expected_pr_number=expected_pr_number,
+                )
+                return Response(result, status=status.HTTP_200_OK)
+
+            raw_overrides = request.data.get('manual_overrides', '')
+            try:
+                manual_overrides = json.loads(raw_overrides) if raw_overrides else None
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise SignedPRImportError('Manual corrections must be a valid JSON object.') from exc
+            if manual_overrides is not None and not isinstance(manual_overrides, dict):
+                raise SignedPRImportError('Manual corrections must be a JSON object.')
+
+            result = import_signed_pr_pdf(
+                pdf_bytes,
+                filename=pdf_file.name,
+                uploaded_by=request.user,
+                approvals=approvals,
+                signatures_verified=None,
+                approval_date=str(request.data.get('approval_date', '')).strip(),
+                expected_pr_number=expected_pr_number,
+                manual_overrides=manual_overrides,
+            )
+        except SignedPRImportError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_200_OK)
+
     @action(detail=False, methods=['post'])
     def check_pr_number(self, request):
         """
@@ -339,18 +453,19 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
             workflow = pr.approval_workflow_config
             if not isinstance(workflow, list):
                 continue
-            current_stage = next(
-                (
-                    stage for stage in workflow
-                    if isinstance(stage, dict)
-                    and str(stage.get('status', 'pending')).lower() != 'approved'
-                ),
-                None,
-            )
-            if not current_stage:
+            pending = [
+                (index, stage) for index, stage in enumerate(workflow)
+                if isinstance(stage, dict)
+                and str(stage.get('status', 'pending')).lower() in ('pending', 'in_review')
+            ]
+            if not pending:
                 continue
-            assigned_user_id = current_stage.get('user_id') or current_stage.get('approver_id')
-            if is_super_admin or str(assigned_user_id) == str(request.user.id):
+            active_level = min(RequisitionWorkflowService._stage_level(stage, index) for index, stage in pending)
+            active_stages = [stage for index, stage in pending if RequisitionWorkflowService._stage_level(stage, index) == active_level]
+            if is_super_admin or any(
+                str(stage.get('user_id') or stage.get('approver_id')) == str(request.user.id)
+                for stage in active_stages
+            ):
                 assigned.append(pr)
 
         count = len(assigned)
@@ -607,16 +722,17 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
         matched_by_job_title = len(matched_user_ids) > 0
 
         profiles = UserProfile.objects.filter(
-            Q(user__is_superuser=True)
-            | Q(
-                roles__is_active=True,
-                roles__modules__code='procurement_requisitions',
-                roles__modules__is_active=True,
-            ),
-            status='active',
-            is_deleted=False,
-            user__is_active=True,
+            status='active', is_deleted=False, user__is_active=True,
         ).select_related('user').distinct()
+        if role != 'any_active':
+            profiles = profiles.filter(
+                Q(user__is_superuser=True)
+                | Q(
+                    roles__is_active=True,
+                    roles__modules__code='procurement_requisitions',
+                    roles__modules__is_active=True,
+                )
+            ).distinct()
 
         profiles = sorted(
             profiles,
@@ -1504,6 +1620,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     serializer_class = PurchaseOrderSerializer
     permission_classes = [IsAuthenticated, HasModuleAccess]
     module_required = 'procurement_orders'
+    pagination_class = VendorPagination
     
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1525,6 +1642,25 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             )
         
         return queryset
+
+    @action(
+        detail=False,
+        methods=['post'],
+        url_path='import-excel',
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def import_excel(self, request):
+        """Preview or upsert the authoritative PO register with PR linkage."""
+        upload = request.FILES.get('file')
+        if not upload:
+            return Response({'error': 'Select an Excel file to import.'}, status=status.HTTP_400_BAD_REQUEST)
+        dry_run = str(request.data.get('dry_run', 'true')).strip().lower() not in {'false', '0', 'no'}
+        from .services.po_excel_import import POExcelImportError, import_po_workbook
+        try:
+            result = import_po_workbook(upload, user=request.user, dry_run=dry_run)
+        except POExcelImportError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_200_OK)
     
     @action(detail=True, methods=['post'])
     def send_to_vendor(self, request, pk=None):
@@ -1853,6 +1989,31 @@ class PODocumentViewSet(viewsets.ReadOnlyModelViewSet):
                 {'success': False, 'document_id': str(doc.id), 'error': str(exc)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+    @action(detail=False, methods=['post'], url_path='import_signed_pdf',
+            parser_classes=[MultiPartParser, FormParser])
+    def import_signed_pdf(self, request):
+        """Import, reconcile, persist, and verify a signed Purchase Order PDF."""
+        pdf_file = request.FILES.get('file')
+        if not pdf_file:
+            return Response({'error': 'Select a signed PDF file to import.'}, status=status.HTTP_400_BAD_REQUEST)
+        if pdf_file.size > 15 * 1024 * 1024:
+            return Response({'error': 'PDF file must not exceed 15 MB.'}, status=status.HTTP_400_BAD_REQUEST)
+        from .services.signed_po_pdf_import import SignedPOImportError, import_signed_po_pdf
+        try:
+            result = import_signed_po_pdf(
+                pdf_file.read(),
+                filename=pdf_file.name,
+                user=request.user,
+                signature_verified=str(request.data.get('signature_verified', 'false')).lower() == 'true',
+                stamp_verified=str(request.data.get('stamp_verified', 'false')).lower() == 'true',
+                approved_by_name=request.data.get('approved_by_name', ''),
+                approved_by_title=request.data.get('approved_by_title', ''),
+                approved_date=request.data.get('approved_date', ''),
+            )
+        except SignedPOImportError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='confirm_po')
     def confirm_po(self, request, pk=None):

@@ -1,7 +1,9 @@
 ﻿"""Transactional state transitions for Purchase Requisitions."""
 
 from decimal import Decimal
+import re
 from django.core.exceptions import ObjectDoesNotExist
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -19,7 +21,7 @@ class RequisitionWorkflowService:
 
     STAGE_CONFIG = {
         'pm': {
-            'labels': ('project manager', 'technical review'),
+            'labels': ('level 1 approver', 'project manager', 'department manager', 'technical review'),
             'name_field': 'pm_name',
             'signature_field': 'pm_signature',
             'status_field': 'pm_approval_status',
@@ -86,6 +88,99 @@ class RequisitionWorkflowService:
                 pr.current_approval_step = index
                 return index, stage
         raise ValidationError({'error': 'No active approval stage awaiting action.'})
+
+    @classmethod
+    def _stage_level(cls, stage, index):
+        try:
+            explicit_level = stage.get('level')
+            if explicit_level not in (None, ''):
+                return max(1, int(explicit_level))
+            # Compatibility for records created while the API was stripping
+            # the explicit level field (for example "Level 1 - Approver 2").
+            label = f"{stage.get('stage', '')} {stage.get('role', '')}"
+            match = re.search(r'\blevel\s*(\d+)\b', label, re.IGNORECASE)
+            if match:
+                return max(1, int(match.group(1)))
+            return index + 1
+        except (TypeError, ValueError):
+            return index + 1
+
+    @classmethod
+    def _active_level_stages(cls, pr, workflow):
+        pending = [
+            (index, stage)
+            for index, stage in enumerate(workflow)
+            if str(stage.get('status', 'pending')).lower() in ('pending', 'in_review')
+        ]
+        if not pending:
+            raise ValidationError({'error': 'No active approval stage awaiting action.'})
+        active_level = min(cls._stage_level(stage, index) for index, stage in pending)
+        active = [
+            (index, stage) for index, stage in pending
+            if cls._stage_level(stage, index) == active_level
+        ]
+        pr.current_approval_step = active[0][0]
+        return active_level, active
+
+    @classmethod
+    def _actor_stage(cls, active_stages, actor, expected_stage_key=None):
+        candidates = [
+            entry for entry in active_stages
+            if not expected_stage_key or cls._stage_key(entry[1]) == expected_stage_key
+        ]
+        if cls._is_super_admin(actor):
+            if candidates:
+                return candidates[0]
+        else:
+            for entry in candidates:
+                assigned_id = entry[1].get('user_id') or entry[1].get('approver_id')
+                if str(assigned_id) == str(actor.id):
+                    return entry
+
+        stage_name = active_stages[0][1].get('stage') or active_stages[0][1].get('role') or 'current approval level'
+        if expected_stage_key and not candidates:
+            raise ValidationError({'error': f'{stage_name} must be completed next.'})
+        raise PermissionDenied(f'Only an assigned approver may act on {stage_name}.')
+
+    @classmethod
+    def _notify_level(cls, pr, workflow, level):
+        if not getattr(pr, 'pk', None):
+            return
+        recipient_ids = {
+            stage.get('user_id') or stage.get('approver_id')
+            for index, stage in enumerate(workflow)
+            if cls._stage_level(stage, index) == level
+        }
+        recipient_ids.discard(None)
+        pr_id = pr.pk
+        pr_number = pr.pr_number
+
+        def send_notifications():
+            from apps.notifications.models import Notification
+            from apps.notifications.services import NotificationService
+            already_notified_ids = set(
+                Notification.objects.filter(
+                    recipient_id__in=recipient_ids,
+                    metadata__pr_id=str(pr_id),
+                    metadata__approval_level=level,
+                ).values_list('recipient_id', flat=True)
+            )
+            users = get_user_model().objects.filter(
+                pk__in=recipient_ids, is_active=True,
+            ).exclude(pk__in=already_notified_ids)
+            for recipient in users:
+                NotificationService.create_notification(
+                    recipient=recipient,
+                    title=f'PR {pr_number} requires your approval',
+                    message=f'You have been assigned as a Level {level} approver for Purchase Requisition {pr_number}.',
+                    category='APPROVAL',
+                    priority='HIGH',
+                    action_url=f'/procurement/requisitions/{pr_id}',
+                    action_label='Review requisition',
+                    metadata={'pr_id': str(pr_id), 'pr_number': pr_number, 'approval_level': level},
+                )
+
+        transaction.on_commit(send_notifications)
 
     @classmethod
     def _enforce_assigned_approver(cls, stage, actor):
@@ -155,9 +250,13 @@ class RequisitionWorkflowService:
         workflow = cls._workflow(pr)
 
         # Pass 1: Validate all stages before mutating memory
+        assigned_ids = []
         for index, stage in enumerate(workflow):
             if not (stage.get('user_id') or stage.get('approver_id')):
                 raise ValidationError({'error': f'Approval stage {index + 1} has no assigned approver.'})
+            assigned_ids.append(str(stage.get('user_id') or stage.get('approver_id')))
+        if len(assigned_ids) != len(set(assigned_ids)):
+            raise ValidationError({'error': 'Each employee may only be assigned once in an approval workflow.'})
 
         # Pass 2: Clean and initialize
         for index, stage in enumerate(workflow):
@@ -176,6 +275,8 @@ class RequisitionWorkflowService:
         pr.status = 'submitted'
         pr.rejection_reason = ''
         pr.save()
+        first_level = min(cls._stage_level(stage, index) for index, stage in enumerate(workflow))
+        cls._notify_level(pr, workflow, first_level)
         return pr
 
     @classmethod
@@ -192,9 +293,8 @@ class RequisitionWorkflowService:
             raise ValidationError({'error': 'Signature cannot exceed 500 characters.'})
 
         workflow = cls._workflow(pr)
-        current_index, stage = cls._current_stage(pr, workflow)
-        cls._enforce_expected_stage(stage, expected_stage_key)
-        cls._enforce_assigned_approver(stage, actor)
+        active_level, active_stages = cls._active_level_stages(pr, workflow)
+        current_index, stage = cls._actor_stage(active_stages, actor, expected_stage_key)
 
         approved_at = timezone.now()
         actor_name = actor.get_full_name() or getattr(actor, 'username', '') or getattr(actor, 'email', '')
@@ -204,23 +304,29 @@ class RequisitionWorkflowService:
         stage['approved_by_name'] = actor_name
         cls._mirror_fixed_approval(pr, stage, actor, signature or '', approved_at)
 
-        next_index = next(
-            (
-                index for index in range(current_index + 1, len(workflow))
-                if str(workflow[index].get('status', 'pending')).lower() not in ('approved', 'rejected')
-            ),
-            None,
-        )
+        remaining_current_level = [
+            (index, candidate) for index, candidate in enumerate(workflow)
+            if cls._stage_level(candidate, index) == active_level
+            and str(candidate.get('status', 'pending')).lower() in ('pending', 'in_review')
+        ]
+        next_pending = [
+            (index, candidate) for index, candidate in enumerate(workflow)
+            if str(candidate.get('status', 'pending')).lower() in ('pending', 'in_review')
+        ]
 
-        if next_index is None:
+        if not next_pending:
             pr.current_approval_step = len(workflow)
             pr.status = 'approved'
             pr.approved_by = actor
             pr.approved_at = approved_at
         else:
+            next_index, next_stage = (remaining_current_level or next_pending)[0]
             pr.current_approval_step = next_index
             pr.status = 'in_review'
             workflow[next_index]['status'] = 'pending'
+            next_level = cls._stage_level(next_stage, next_index)
+            if not remaining_current_level and next_level != active_level:
+                cls._notify_level(pr, workflow, next_level)
 
         pr.approval_workflow_config = workflow
         pr.save()
@@ -244,9 +350,8 @@ class RequisitionWorkflowService:
             raise ValidationError({'error': 'Rejection reason cannot exceed 1000 characters.'})
 
         workflow = cls._workflow(pr)
-        _, stage = cls._current_stage(pr, workflow)
-        cls._enforce_expected_stage(stage, expected_stage_key)
-        cls._enforce_assigned_approver(stage, actor)
+        _, active_stages = cls._active_level_stages(pr, workflow)
+        _, stage = cls._actor_stage(active_stages, actor, expected_stage_key)
 
         rejected_at = timezone.now()
         actor_name = actor.get_full_name() or getattr(actor, 'username', '') or getattr(actor, 'email', '')

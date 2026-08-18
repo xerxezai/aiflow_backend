@@ -63,10 +63,10 @@ class PurchaseOrderNumberService:
         if not PO_NUMBER_PATTERN.fullmatch(value):
             return False, 'PO number does not follow RAD-{GEN|PRJ}-PUR-####_YYYY.'
         if pr_number:
-            try:
-                expected = cls.from_requisition(pr_number)
-            except ValueError as exc:
-                return False, str(exc)
-            if value != expected:
-                return False, f'PO number must match source requisition as {expected}.'
+            pr_match = PR_NUMBER_PATTERN.fullmatch(str(pr_number or '').strip())
+            if not pr_match:
+                return False, 'Source PR number does not follow the company numbering standard.'
+            po_match = PO_NUMBER_PATTERN.fullmatch(value)
+            if po_match.group(1) != pr_match.group(1) or po_match.group(3) != pr_match.group(3):
+                return False, 'PO and source PR must use the same GEN/PRJ scope and year.'
         return True, 'Verified against the company PO numbering standard.'

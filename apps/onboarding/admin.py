@@ -4,7 +4,7 @@ Onboarding & Offboarding Admin Configuration
 from django.contrib import admin
 from .models import (
     OnboardingRecord, OffboardingRecord, Equipment,
-    Document, AccessProvisioning, Checklist
+    Document, AccessProvisioning, Checklist, ExitApproval
 )
 
 
@@ -53,3 +53,33 @@ class ChecklistAdmin(admin.ModelAdmin):
     list_filter = ['priority', 'completed']
     search_fields = ['task_name', 'description']
     date_hierarchy = 'due_date'
+
+
+@admin.register(ExitApproval)
+class ExitApprovalAdmin(admin.ModelAdmin):
+    list_display = ['offboarding_record', 'approver', 'approval_step', 'status', 'decided_at', 'created_at']
+    list_filter = ['approval_step', 'status', 'notification_sent']
+    search_fields = ['offboarding_record__employee_name', 'offboarding_record__employee_email', 'approver__username', 'approver__email']
+    readonly_fields = ['created_at', 'updated_at', 'notification_sent_at', 'last_reminder_sent_at']
+    date_hierarchy = 'created_at'
+    ordering = ['-created_at']
+    
+    fieldsets = (
+        ('Offboarding Information', {
+            'fields': ('offboarding_record', 'approval_step')
+        }),
+        ('Approver', {
+            'fields': ('approver', 'status')
+        }),
+        ('Decision Details', {
+            'fields': ('decision_note', 'decided_at')
+        }),
+        ('Notification Tracking', {
+            'fields': ('notification_sent', 'notification_sent_at', 'reminder_sent_count', 'last_reminder_sent_at'),
+            'classes': ('collapse',)
+        }),
+        ('Timestamps', {
+            'fields': ('created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )

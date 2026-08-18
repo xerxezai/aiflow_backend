@@ -4,6 +4,7 @@ Automatically checks and enforces password expiry policy on each request
 """
 from django.utils import timezone
 from django.http import JsonResponse
+from django.db.utils import OperationalError
 from config.password_policy import get_password_expiry_status
 import logging
 
@@ -40,7 +41,19 @@ class PasswordExpiryMiddleware:
     def __call__(self, request):
         """Process request"""
         # Check password expiry before processing request
-        response = self._check_password_expiry(request)
+        try:
+            response = self._check_password_expiry(request)
+        except OperationalError:
+            # Authentication is session-backed, so a temporary database/DNS
+            # outage can occur while Django evaluates request.user. Surface a
+            # retryable service response instead of an internal-server error.
+            logger.warning('Database temporarily unavailable while evaluating the authenticated session')
+            response = JsonResponse({
+                'error': 'database_temporarily_unavailable',
+                'detail': 'The database is temporarily unavailable. Please retry shortly.',
+            }, status=503)
+            response['Retry-After'] = '5'
+            return response
         
         if response:
             return response

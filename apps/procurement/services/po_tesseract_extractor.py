@@ -21,6 +21,10 @@ from difflib import SequenceMatcher
 
 import boto3
 from django.conf import settings
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+from django.utils.text import get_valid_filename
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -446,6 +450,15 @@ def upload_to_s3(pdf_bytes: bytes, original_filename: str, user_id: str) -> Dict
     now = datetime.now()
     date_path = now.strftime('%Y/%m/%d')
     s3_key = f'procurement/po_uploads/{date_path}/{user_id}/{original_filename}'
+
+    if not getattr(settings, 'USE_S3', False):
+        safe_name = get_valid_filename(original_filename) or 'procurement-document.pdf'
+        storage_key = (
+            f'procurement/po_uploads/{date_path}/{user_id}/'
+            f'{uuid.uuid4().hex}_{safe_name}'
+        )
+        stored_key = default_storage.save(storage_key, ContentFile(pdf_bytes))
+        return {'s3_key': stored_key, 's3_url': default_storage.url(stored_key)}
     
     try:
         # Soft-coded S3 configuration from Django settings

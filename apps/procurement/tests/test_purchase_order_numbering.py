@@ -44,16 +44,22 @@ class PurchaseOrderNumberServiceTests(SimpleTestCase):
         with self.assertRaisesMessage(ValueError, 'company numbering standard'):
             PurchaseOrderNumberService.from_requisition('PR-42')
 
-    def test_verification_checks_corresponding_pr_document(self):
+    def test_verification_checks_pr_scope_and_year_but_allows_independent_sequence(self):
         verified, _ = PurchaseOrderNumberService.verify(
             'RAD-PRJ-PUR-0042_2026',
             'RAD-PRJ-PR-0042_2026',
         )
-        mismatched, message = PurchaseOrderNumberService.verify(
+        independent_sequence, _ = PurchaseOrderNumberService.verify(
             'RAD-PRJ-PUR-0043_2026',
             'RAD-PRJ-PR-0042_2026',
         )
 
+        mismatched, message = PurchaseOrderNumberService.verify(
+            'RAD-GEN-PUR-0043_2026',
+            'RAD-PRJ-PR-0042_2026',
+        )
+
         self.assertTrue(verified)
+        self.assertTrue(independent_sequence)
         self.assertFalse(mismatched)
-        self.assertIn('RAD-PRJ-PUR-0042_2026', message)
+        self.assertIn('same GEN/PRJ scope and year', message)

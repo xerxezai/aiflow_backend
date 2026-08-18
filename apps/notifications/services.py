@@ -6,6 +6,7 @@ from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
 from django.utils.html import strip_tags
 from django.conf import settings
+from django.core.cache import cache
 from django.utils import timezone
 from .models import Notification, NotificationCategory, NotificationPreference, NotificationLog
 from celery import shared_task
@@ -192,7 +193,12 @@ class NotificationService:
                 send_email=send_email and prefs.enable_email,
                 send_sms=notification_data.get('send_sms', False) and prefs.enable_sms,
                 metadata=notification_data.get('metadata', {}),
+                # An in-app notification is delivered as soon as its database
+                # row exists. Leaving it PENDING hides it from unread_count.
+                status='SENT' if prefs.enable_in_app else 'PENDING',
             )
+
+            cache.delete(f'notification_unread_count_{recipient.id}')
             
             # Log creation
             NotificationLog.objects.create(

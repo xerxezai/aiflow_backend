@@ -238,6 +238,10 @@ class OffboardingRecordSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True)
     assigned_to_name = serializers.CharField(source='assigned_to.get_full_name', read_only=True)
     
+    # ✨ Three-step approval workflow field names
+    hr_coordinator_name = serializers.CharField(source='hr_coordinator.get_full_name', read_only=True)
+    hr_approver_name = serializers.CharField(source='hr_approver.get_full_name', read_only=True)
+    
     days_until_exit = serializers.SerializerMethodField()
     days_since_initiated = serializers.SerializerMethodField()
     checklist_stage_permissions = serializers.SerializerMethodField(read_only=True)
@@ -248,6 +252,9 @@ class OffboardingRecordSerializer(serializers.ModelSerializer):
     project_manager_decided_by_name = serializers.CharField(
         source='project_manager_decided_by.get_full_name', read_only=True
     )
+    
+    # ✨ Exit approval workflow (project managers list)
+    exit_approvals = serializers.SerializerMethodField(read_only=True)
     
     class Meta:
         model = OffboardingRecord
@@ -260,9 +267,17 @@ class OffboardingRecordSerializer(serializers.ModelSerializer):
             'created_by', 'created_by_name', 'assigned_to', 'assigned_to_name',
             'notes', 'rejection_reason', 'rejected_by', 'rejected_by_name',
             'rejected_at', 'created_at', 'updated_at',
+            # Legacy project manager approval (deprecated)
             'project_manager_approval_status', 'project_manager_decided_by',
             'project_manager_decided_by_name', 'project_manager_decided_at',
             'project_manager_decision_note',
+            # ✨ New three-step approval workflow
+            'hr_coordinator', 'hr_coordinator_name', 'hr_coordinator_approval_status',
+            'hr_coordinator_approved_at', 'hr_coordinator_note',
+            'hr_approver', 'hr_approver_name', 'hr_approver_approval_status',
+            'hr_approver_approved_at', 'hr_approver_note',
+            'approval_workflow_status', 'exit_approvals',
+            # Nested data
             'equipment', 'documents', 'access_records', 'checklist_items',
             'days_until_exit', 'days_since_initiated', 'checklist_stage_permissions',
             'ongoing_projects', 'has_ongoing_projects', 'can_manage_actions'
@@ -271,6 +286,9 @@ class OffboardingRecordSerializer(serializers.ModelSerializer):
             'rejection_reason', 'rejected_by', 'rejected_at',
             'project_manager_approval_status', 'project_manager_decided_by',
             'project_manager_decided_at', 'project_manager_decision_note',
+            'hr_coordinator_approval_status', 'hr_coordinator_approved_at',
+            'hr_approver_approval_status', 'hr_approver_approved_at',
+            'approval_workflow_status',
         ]
 
     def get_ongoing_projects(self, obj):
@@ -286,6 +304,31 @@ class OffboardingRecordSerializer(serializers.ModelSerializer):
         from .rbac import offboarding_stage_permissions
         request = self.context.get('request')
         return offboarding_stage_permissions(getattr(request, 'user', None), obj)
+    
+    def get_exit_approvals(self, obj):
+        """
+        ✨ Return list of exit approvals (project managers, HR coordinator, HR approver)
+        Grouped by approval step with status, decision details, and project assignment
+        """
+        from .models import ExitApproval
+        approvals = ExitApproval.objects.filter(offboarding_record=obj).select_related('approver')
+        
+        return [{
+            'id': approval.id,
+            'approver_id': approval.approver.id if approval.approver else None,
+            'approver_name': approval.approver.get_full_name() if approval.approver else 'Unassigned',
+            'approver_email': approval.approver.email if approval.approver else None,
+            'approval_step': approval.approval_step,
+            'approval_step_display': approval.get_approval_step_display(),
+            'status': approval.status,
+            'status_display': approval.get_status_display(),
+            'decision_note': approval.decision_note,
+            'decided_at': approval.decided_at,
+            'created_at': approval.created_at,
+            # ✨ NEW: Project assignment details for multi-project scenario
+            'project_number': approval.project_number,
+            'project_name': approval.project_name,
+        } for approval in approvals]
 
     def validate(self, attrs):
         """Prevent more than one active offboarding process per employee."""

@@ -267,6 +267,7 @@ class OffboardingRecord(models.Model):
     rejected_at = models.DateTimeField(null=True, blank=True)
 
     # Project-manager clearance for employees assigned to active projects.
+    # DEPRECATED: Legacy single project manager approval (kept for backwards compatibility)
     project_manager_approval_status = models.CharField(
         max_length=20,
         choices=[
@@ -283,6 +284,62 @@ class OffboardingRecord(models.Model):
     )
     project_manager_decided_at = models.DateTimeField(null=True, blank=True)
     project_manager_decision_note = models.TextField(blank=True, null=True)
+    
+    # ✨ NEW: Three-step approval workflow
+    # Step 1: Multiple Project Managers (many-to-many relationship via ExitApproval model)
+    # Step 2: HR Coordinator
+    hr_coordinator = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='offboarding_hr_coordinator_assignments',
+        help_text='HR Coordinator responsible for processing exit documentation'
+    )
+    hr_coordinator_approval_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('not_required', 'Not Required'),
+            ('pending', 'Pending'),
+            ('approved', 'Approved'),
+            ('rejected', 'Rejected'),
+        ],
+        default='pending',
+    )
+    hr_coordinator_approved_at = models.DateTimeField(null=True, blank=True)
+    hr_coordinator_note = models.TextField(blank=True, null=True)
+    
+    # Step 3: HR Approver (final approval)
+    hr_approver = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='offboarding_hr_approver_assignments',
+        help_text='HR Manager/Approver for final exit approval'
+    )
+    hr_approver_approval_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('not_required', 'Not Required'),
+            ('pending', 'Pending'),
+            ('approved', 'Approved'),
+            ('rejected', 'Rejected'),
+        ],
+        default='pending',
+    )
+    hr_approver_approved_at = models.DateTimeField(null=True, blank=True)
+    hr_approver_note = models.TextField(blank=True, null=True)
+    
+    # Overall approval workflow status
+    approval_workflow_status = models.CharField(
+        max_length=30,
+        choices=[
+            ('not_started', 'Not Started'),
+            ('project_managers_pending', 'Awaiting Project Manager(s) Approval'),
+            ('hr_coordinator_pending', 'Awaiting HR Coordinator Approval'),
+            ('hr_approver_pending', 'Awaiting HR Approver'),
+            ('approved', 'Fully Approved'),
+            ('rejected', 'Rejected'),
+        ],
+        default='not_started',
+        db_index=True,
+        help_text='Current stage in the three-step approval workflow'
+    )
     
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
@@ -441,3 +498,109 @@ class Checklist(models.Model):
     
     def __str__(self):
         return f"{self.task_name} ({'Completed' if self.completed else 'Pending'})"
+
+
+class ExitApproval(models.Model):
+    """
+    ✨ Three-step approval workflow for offboarding
+    Tracks individual approvals from Project Managers (Step 1), HR Coordinator (Step 2), HR Approver (Step 3)
+    Soft-coded approval statuses and decision tracking with project assignment support
+    """
+    offboarding_record = models.ForeignKey(
+        OffboardingRecord,
+        on_delete=models.CASCADE,
+        related_name='exit_approvals',
+        help_text='The offboarding record requiring approval'
+    )
+    
+    # Approver details
+    approver = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='exit_approval_assignments',
+        help_text='User assigned to approve this exit (Project Manager, HR Coordinator, or HR Approver)'
+    )
+    
+    # Approval step/role
+    approval_step = models.CharField(
+        max_length=30,
+        choices=[
+            ('project_manager', 'Project Manager'),
+            ('hr_coordinator', 'HR Coordinator'),
+            ('hr_approver', 'HR Approver'),
+        ],
+        db_index=True,
+        help_text='Which step in the approval workflow this record represents'
+    )
+    
+    # ✨ NEW: Project assignment for multi-project scenario
+    # Soft-coded: Links the approval to a specific project when employee works on multiple projects
+    project_number = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text='Project number/code this approval is for (when employee is assigned to multiple projects)'
+    )
+    project_name = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text='Project name for better readability'
+    )
+    
+    # Approval status
+    status = models.CharField(
+        max_length=20,
+        choices=[
+            ('pending', 'Pending'),
+            ('approved', 'Approved'),
+            ('rejected', 'Rejected'),
+        ],
+        default='pending',
+        db_index=True,
+    )
+    
+    # Decision details
+    decision_note = models.TextField(
+        blank=True,
+        null=True,
+        help_text='Optional note/reason from the approver'
+    )
+    decided_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text='Timestamp when the approval decision was made'
+    )
+    
+    # Notification tracking
+    notification_sent = models.BooleanField(
+        default=False,
+        help_text='Whether approval request notification was sent to approver'
+    )
+    notification_sent_at = models.DateTimeField(null=True, blank=True)
+    reminder_sent_count = models.IntegerField(
+        default=0,
+        help_text='Number of reminder notifications sent'
+    )
+    last_reminder_sent_at = models.DateTimeField(null=True, blank=True)
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'exit_approval'
+        ordering = ['offboarding_record', 'approval_step', 'created_at']
+        indexes = [
+            models.Index(fields=['offboarding_record', 'approval_step']),
+            models.Index(fields=['approver', 'status']),
+            models.Index(fields=['status', 'created_at']),
+        ]
+        # Ensure one approval record per approver per offboarding
+        unique_together = [['offboarding_record', 'approver', 'approval_step']]
+    
+    def __str__(self):
+        approver_name = self.approver.get_full_name() if self.approver else 'Unassigned'
+        return f"{self.get_approval_step_display()} - {approver_name} ({self.status})"

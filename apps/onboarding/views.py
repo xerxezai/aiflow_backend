@@ -938,7 +938,15 @@ class OffboardingRecordViewSet(viewsets.ModelViewSet):
         return queryset.select_related('created_by', 'assigned_to', 'rejected_by', 'user')
     
     def perform_create(self, serializer):
-        """Allow HR to initiate any exit while employees may initiate only their own."""
+        """
+        Allow HR to initiate any exit while employees may initiate only their own.
+        ✨ ENHANCED: Create ExitApproval records for three-step approval workflow with project-based assignments
+        """
+        # Extract approval workflow data from request
+        project_assignments = self.request.data.get('project_assignments', [])
+        hr_coordinator_id = self.request.data.get('hr_coordinator')
+        hr_approver_id = self.request.data.get('hr_approver')
+        
         if can_manage_offboarding(self.request.user):
             selected_user = serializer.validated_data.get('user')
             reporting_manager = _resolve_exit_reporting_manager(selected_user)
@@ -948,7 +956,78 @@ class OffboardingRecordViewSet(viewsets.ModelViewSet):
             }
             if reporting_manager:
                 save_values['reporting_manager'] = reporting_manager
+            
+            # ✨ Set HR coordinator and approver if provided
+            if hr_coordinator_id:
+                save_values['hr_coordinator_id'] = hr_coordinator_id
+            if hr_approver_id:
+                save_values['hr_approver_id'] = hr_approver_id
+            
+            # ✨ Set initial approval workflow status based on project assignments
+            has_project_managers = any(pa.get('project_manager_ids') for pa in project_assignments)
+            if has_project_managers:
+                save_values['approval_workflow_status'] = 'project_managers_pending'
+            elif hr_coordinator_id:
+                save_values['approval_workflow_status'] = 'hr_coordinator_pending'
+            elif hr_approver_id:
+                save_values['approval_workflow_status'] = 'hr_approver_pending'
+            else:
+                save_values['approval_workflow_status'] = 'not_started'
+            
             record = serializer.save(**save_values)
+            
+            # ✨ Create ExitApproval records for project-based assignments
+            from .models import ExitApproval
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            
+            # Process each project assignment
+            for project_assignment in project_assignments:
+                project_number = project_assignment.get('project_number', '')
+                project_name = project_assignment.get('project_name', '')
+                project_manager_ids = project_assignment.get('project_manager_ids', [])
+                
+                # Create ExitApproval for each project manager in this project
+                for pm_id in project_manager_ids:
+                    try:
+                        pm_user = User.objects.get(id=pm_id)
+                        ExitApproval.objects.create(
+                            offboarding_record=record,
+                            approver=pm_user,
+                            approval_step='project_manager',
+                            status='pending',
+                            project_number=project_number,
+                            project_name=project_name
+                        )
+                    except User.DoesNotExist:
+                        pass
+            
+            # ✨ Create ExitApproval for HR Coordinator
+            if hr_coordinator_id:
+                try:
+                    hr_coord_user = User.objects.get(id=hr_coordinator_id)
+                    ExitApproval.objects.create(
+                        offboarding_record=record,
+                        approver=hr_coord_user,
+                        approval_step='hr_coordinator',
+                        status='pending'
+                    )
+                except User.DoesNotExist:
+                    pass
+            
+            # ✨ Create ExitApproval for HR Approver
+            if hr_approver_id:
+                try:
+                    hr_approver_user = User.objects.get(id=hr_approver_id)
+                    ExitApproval.objects.create(
+                        offboarding_record=record,
+                        approver=hr_approver_user,
+                        approval_step='hr_approver',
+                        status='pending'
+                    )
+                except User.DoesNotExist:
+                    pass
+            
             _notify_project_managers_of_exit(record)
             return
 
