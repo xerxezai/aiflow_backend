@@ -181,14 +181,22 @@ class RoleViewSet(viewsets.ModelViewSet):
     from apps.rbac.rbac_config import MODULE_ASSIGNMENT_CONFIG as _mac
     _CUSTOM_PREFIX = _mac.get('custom_role_prefix', 'custom_')
 
-    queryset = Role.objects.prefetch_related('permissions', 'modules', 'user_profiles') \
+    queryset = Role.objects.all()
+
+    def get_queryset(self):
+        from django.db.models import OuterRef, Subquery, IntegerField
+        from apps.rbac.models import UserProfile
+        user_count_subquery = Subquery(
+            UserProfile.objects.filter(
+                roles=OuterRef('pk'),
+                is_deleted=False
+            ).values('roles').annotate(c=Count('id')).values('c'),
+            output_field=IntegerField()
+        )
+        return Role.objects.prefetch_related('permissions', 'modules') \
                            .filter(is_active=True) \
-                           .exclude(code__startswith=_CUSTOM_PREFIX) \
-                           .annotate(user_count_annotated=Count(
-                               'user_profiles',
-                               filter=Q(user_profiles__is_deleted=False),
-                               distinct=True,
-                           ))
+                           .exclude(code__startswith=self._CUSTOM_PREFIX) \
+                           .annotate(user_count_annotated=user_count_subquery)
     permission_classes = [IsAuthenticated, CanManageRoles]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
     search_fields = ['name', 'code']
