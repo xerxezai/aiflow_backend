@@ -187,9 +187,9 @@ class CanManageUsers(permissions.BasePermission):
                 is_active=True
             ).exists():
                 return True
-            
-            # Check if user has user_mgmt module access (soft-coded)
-            if profile.has_module_access('user_mgmt'):
+
+            # Module-based check for custom roles
+            if profile.has_module_access('hr_management') or profile.has_module_access('user_mgmt'):
                 return True
             
             # Check specific permission

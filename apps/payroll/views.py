@@ -924,11 +924,16 @@ class AttendanceOverrideViewSet(viewsets.ModelViewSet):
 # =============================================================================
 
 def _is_senior_hr(user) -> bool:
-    """True for superuser, staff, or roles with senior-level HR access."""
+    """True for superuser, staff, or users with payroll module assigned."""
     if getattr(user, 'is_superuser', False) or getattr(user, 'is_staff', False):
         return True
     try:
-        roles = user.rbac_profile.roles.all()
+        profile = user.rbac_profile
+        # Check module assignment - works for any role including custom roles
+        if profile.has_module_access('payroll'):
+            return True
+        # Keep existing role-based check as fallback
+        roles = profile.roles.all()
         for role in roles:
             code = (role.code or '').lower()
             if code.startswith('senior_hr') or code in ('admin', 'superadmin', 'manager', 'hr_admin'):
