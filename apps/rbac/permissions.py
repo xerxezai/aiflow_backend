@@ -183,7 +183,7 @@ class CanManageUsers(permissions.BasePermission):
             
             # Super admin, admin, and ICT admin can manage users (soft-coded)
             if profile.roles.filter(
-                code__in=['super_admin', 'admin', 'ict_admin'],
+                code__in=['super_admin', 'admin', 'ict_admin', 'hr_admin'],
                 is_active=True
             ).exists():
                 return True
