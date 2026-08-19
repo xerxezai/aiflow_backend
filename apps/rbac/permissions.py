@@ -48,10 +48,15 @@ class IsAdmin(permissions.BasePermission):
         # Check RBAC roles (soft-coded from rbac_config.py)
         try:
             profile = request.user.rbac_profile
-            return profile.roles.filter(
-                code__in=['super_admin', 'admin', 'ict_admin', 'hr_admin'],  # ICT Admin added
+            if profile.roles.filter(
+                code__in=['super_admin', 'admin', 'ict_admin', 'hr_admin'],
                 is_active=True
-            ).exists()
+            ).exists():
+                return True
+            # Module-based check for custom roles
+            if profile.has_module_access('user_mgmt') or profile.has_module_access('hr_management'):
+                return True
+            return False
         except UserProfile.DoesNotExist:
             return False
 
